@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zimmo-scraper"
-version = "0.4.0"
+version = "1.0.0"
 description = "Zimmo.be real-estate listing-page scraper (Playwright, Selenium, Puppeteer, or a cloud browser via CDP) — embedded-JSON parsing, Cloudflare Turnstile / reCAPTCHA v3 solving, proxies, fingerprints"
 readme = "README.md"
 requires-python = ">=3.9"

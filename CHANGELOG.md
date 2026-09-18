@@ -7,6 +7,66 @@ manage. A patch release means "fixes" — not that every flag is frozen,
 so a behaviour-changing default landing in a patch is stated plainly
 here rather than treated as a violation of the format.
 
+## [1.0.0] — Stable public interface (2026-09-18)
+
+No change to what the scraper does. This release is a commitment about
+what will NOT change: from here on the CLI flags and the output schema
+are a public interface, and anything that breaks them is a 2.0.0, not
+a patch. 0.4.0 earned that -- it was the release where a series of
+real runs against the live site replaced guesses with confirmed
+behaviour, and nothing has had to move since.
+
+What is now covered by that promise:
+
+- **The CLI flags of all three engines.** Including the 0.4.0 fix that
+  made `--no-proxy-rotate` a real, working opt-out. Renaming or
+  removing a flag now requires a major bump.
+- **The output schema.** The `Product` dataclass field order, which is
+  also the JSON key order and the CSV header, plus the `.meta.json`
+  run-metadata keys. CI already asserts `sample_output.{json,csv}`
+  match the dataclass exactly, so drift fails the build rather than
+  reaching a consumer.
+- **The "no account needed" promise.** The scraper keeps running with
+  no proxy and no captcha key; those stay opt-in.
+
+What is explicitly NOT covered, because it is not ours to promise:
+zimmo.be's own markup. The parsing paths behind these flags will keep
+moving as the site does -- that is the whole point of the daily canary
+-- and such a change is a patch, not a break, as long as the flags and
+the columns above stay put.
+
+### Added
+- `release.yml`: pushing a `v*` tag cuts a GitHub Release with notes
+  taken from this file's matching section, and refuses the tag unless
+  the tag, `pyproject.toml` and this CHANGELOG agree on the version.
+  A release tagged v1.0.0 against a pyproject still saying 0.4.0 is
+  the kind of mismatch nobody notices until a bug is filed against a
+  version that never existed. It runs on the workflow's own
+  `GITHUB_TOKEN`, so publishing needs no personal token anywhere.
+- The canary now also runs when `canary.yml` itself is edited. It is
+  the one workflow that can sit broken for a full day unnoticed --
+  a typo in it would otherwise surface at 06:17 UTC the next day, to
+  whoever happened to read the log.
+
+### Fixed
+- **The offline CI job could never have been green.** It installed
+  `requirements.txt` alone and then ran `--help` for all three engine
+  scrapers, each of which imports its driver at module level, so every
+  one died with `ModuleNotFoundError`. The module-level import is
+  deliberate -- `engine-smoke` asserts it by `ast` walk precisely so a
+  real `ImportError` cannot decay into a silent skip -- and the three
+  engine requirement files are mutually unsatisfiable in one
+  environment, so the engine CLIs simply do not belong in that job.
+  Their `--help` is covered per engine in `engine-smoke`'s own venv.
+- **`playwright install --with-deps` failed on `ubuntu-latest`.** The
+  pinned `playwright==1.44.0` predates Ubuntu 24.04 and cannot resolve
+  its system packages; support for it landed in playwright 1.45. The
+  Playwright jobs now pin `ubuntu-22.04`, matching the Dockerfile's
+  own `v1.44.0-jammy` base image, so the two pins stay in sync.
+- **A red engine hid the others.** `fail-fast: false` on the engine
+  matrix -- selenium was once cancelled mid-flight by playwright's
+  failure, so its real status was never reported at all.
+
 ## [0.4.0] — Live-run fixes against the real site (2026-09-15/16)
 
 The 0.3.0 audit (below) was static/external and found real bugs; this
