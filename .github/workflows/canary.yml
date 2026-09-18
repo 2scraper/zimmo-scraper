@@ -13,7 +13,10 @@ on:
 
 jobs:
   canary:
-    runs-on: ubuntu-latest
+    # jammy, pinned, for the same reason tests.yml's engine-smoke job
+    # pins it: playwright==1.44.0 cannot install its system deps on
+    # Ubuntu 24.04, and the Dockerfile's base image is v1.44.0-jammy.
+    runs-on: ubuntu-22.04
     # A canary that cannot pass must SKIP, not fail (CLAUDE.md §11) -- a
     # check that is always red teaches everyone to ignore checks. This
     # repo's own confirmed fact is that zimmo.be runs a real Cloudflare

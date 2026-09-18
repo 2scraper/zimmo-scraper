@@ -78,8 +78,26 @@ jobs:
         run: python3 check_no_credentials.py
 
   engine-smoke:
-    runs-on: ubuntu-latest
+    # Playwright alone runs on jammy, pinned, NOT on ubuntu-latest.
+    # requirements-playwright.txt pins playwright==1.44.0 (May 2024),
+    # which predates Ubuntu 24.04 and cannot resolve its system
+    # packages -- `playwright install --with-deps chromium` bails out
+    # on the distro check in seconds, long before it downloads a
+    # browser (observed: run 35385039220, step failed in 8s). noble
+    # support landed in playwright 1.45. This repo's own Dockerfile
+    # already pins the matching base image, v1.44.0-JAMMY, so jammy is
+    # the OS this pin is actually built against -- these two stay in
+    # sync. Bumping the pin instead would mean moving that base image
+    # too; that is a dependency decision, not a CI fix.
+    # The other two engines are pure-Python and stay on ubuntu-latest.
+    runs-on: ${{ matrix.engine == 'playwright' && 'ubuntu-22.04' || 'ubuntu-latest' }}
     strategy:
+      # One broken engine must not cancel the other two: the run that
+      # prompted this had selenium CANCELLED mid-flight by playwright's
+      # failure, so its real status stayed unknown. A matrix that hides
+      # the status of everything after the first red is the same
+      # "check nobody can read" problem canary.yml warns about.
+      fail-fast: false
       matrix:
         engine: [playwright, puppeteer, selenium]
     steps:
