@@ -1,0 +1,80 @@
+name: release
+
+# Cuts a GitHub Release when a v* tag is pushed, with notes lifted from
+# the matching CHANGELOG.md section -- so the release text and the
+# changelog can never drift apart by hand.
+#
+# Uses the run's own GITHUB_TOKEN: nobody needs a personal token on
+# their machine to publish a release, and there is no credential to
+# leak. Offline in the same sense as tests.yml -- it touches nothing
+# but this repository's own API.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The tag, pyproject.toml and CHANGELOG.md must agree. A release
+      # tagged v0.4.0 against a pyproject still saying 0.3.0 is exactly
+      # the kind of mismatch nobody notices until someone files a bug
+      # against a version that never existed.
+      - name: Tag, pyproject and CHANGELOG must agree
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, pathlib
+
+          ref = os.environ.get("GITHUB_REF_NAME", "")
+          if not ref.startswith("v"):
+              sys.exit(f"not a v* tag: {ref!r}")
+          version = ref[1:]
+
+          pyproject = pathlib.Path("pyproject.toml").read_text()
+          m = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.M)
+          if not m:
+              sys.exit("no version = in pyproject.toml")
+          if m.group(1) != version:
+              sys.exit(f"tag {ref} vs pyproject version {m.group(1)} -- they must match")
+
+          changelog = pathlib.Path("CHANGELOG.md").read_text().splitlines()
+          start = None
+          for i, line in enumerate(changelog):
+              if line.startswith(f"## [{version}]"):
+                  start = i
+                  break
+          if start is None:
+              sys.exit(f"CHANGELOG.md has no '## [{version}]' section")
+
+          end = len(changelog)
+          for i in range(start + 1, len(changelog)):
+              if changelog[i].startswith("## ["):
+                  end = i
+                  break
+
+          body = "\n".join(changelog[start + 1:end]).strip()
+          if not body:
+              sys.exit(f"the '## [{version}]' section is empty")
+
+          pathlib.Path("RELEASE_NOTES.md").write_text(body + "\n")
+          print(f"tag, pyproject and CHANGELOG all agree on {version}")
+          print(f"release notes: {len(body.splitlines())} lines")
+          PY
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md \
+            --verify-tag
