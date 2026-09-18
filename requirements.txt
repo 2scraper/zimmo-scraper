@@ -1,0 +1,18 @@
+# Core only — no browser engine. Always installs cleanly on its own:
+#   pip install -r requirements.txt --break-system-packages
+#
+# Then ONE engine-specific file on top, in its OWN virtualenv if you want
+# more than one installed at once (CLAUDE.md §6): playwright and pyppeteer
+# declare mutually unsatisfiable pins (pyee <12 vs >=13), and pyppeteer
+# and selenium collide on urllib3 (<2.0 vs >=2.6). CI's own engine-smoke
+# job installs each engine into its own fresh venv for exactly this
+# reason — never combine all three requirements files into one
+# environment and expect `pip check` to be honest about it.
+#
+#   pip install -r requirements.txt -r requirements-playwright.txt --break-system-packages
+#       && playwright install chromium
+#   pip install -r requirements.txt -r requirements-puppeteer.txt --break-system-packages
+#   pip install -r requirements.txt -r requirements-selenium.txt --break-system-packages
+
+beautifulsoup4>=4.12
+requests>=2.31

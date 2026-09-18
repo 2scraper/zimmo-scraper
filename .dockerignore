@@ -1,0 +1,17 @@
+.env
+.env.example
+.git
+.github
+tests/
+*.json
+*.csv
+sample_output.*
+*_debug.html
+*_debug.png
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv*/
+README.md
+CHANGELOG.md
+CLAUDE.md

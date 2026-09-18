@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zimmo-scraper"
+version = "0.4.0"
+description = "Zimmo.be real-estate listing-page scraper (Playwright, Selenium, Puppeteer, or a cloud browser via CDP) — embedded-JSON parsing, Cloudflare Turnstile / reCAPTCHA v3 solving, proxies, fingerprints"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+# Mirrors requirements-{engine}.txt exactly — kept in sync by hand
+# (CLAUDE.md §6: CI installs only requirements.txt + one of these files
+# directly, not through these extras, so drift here would go unnoticed
+# by CI; check both whenever either changes).
+playwright = ["playwright>=1.44"]
+puppeteer = ["pyppeteer>=2.0"]
+selenium = ["selenium>=4.20", "webdriver-manager>=4.0"]
+
+[tool.setuptools]
+# This is a flat collection of top-level scripts, not a package —
+# setuptools refuses to guess among this many top-level modules, so each
+# one is named explicitly (CLAUDE.md §6).
+py-modules = [
+    "env_config",
+    "output_writer",
+    "product_parser",
+    "captcha_solver",
+    "proxy_pool",
+    "fingerprint_client",
+    "diff_runs",
+    "scraper_api_client",
+    "check_no_credentials",
+    "playwright_scraper",
+    "puppeteer_scraper",
+    "selenium_scraper",
+    "smoke_test",
+]

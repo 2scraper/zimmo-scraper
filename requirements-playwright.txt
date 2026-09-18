@@ -1,0 +1,11 @@
+# EXACTLY pinned, not >=1.44 (external audit, 2026-09-14, codex.md
+# finding #7): Dockerfile's base image (mcr.microsoft.com/playwright/
+# python:v1.44.0-jammy) bundles a SPECIFIC Chromium revision matched to
+# playwright==1.44.0 exactly. An unpinned `>=1.44` requirement lets pip
+# install a newer client library on top of that image, whose expected
+# browser revision would then NOT match what's actually pre-installed --
+# Playwright's own docs require the client library and image tag to
+# match exactly. If you bump this version, bump the Dockerfile's base
+# image tag to the SAME version in the SAME commit -- smoke_test.py
+# checks the two stay in sync.
+playwright==1.44.0

@@ -1,0 +1,142 @@
+name: canary
+
+# One real run daily against a known-good FILTERED CATEGORY URL
+# (CLAUDE.md §11). Requests >=3 pages -- with one page, pagination is
+# never exercised, which is exactly how a silent-single-page bug would
+# survive undetected. Uploads artefacts on every run so a red canary can
+# be diagnosed from the log alone.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"  # daily, off the hour to avoid the top-of-hour GitHub Actions crush
+  workflow_dispatch: {}
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    # A canary that cannot pass must SKIP, not fail (CLAUDE.md §11) -- a
+    # check that is always red teaches everyone to ignore checks. This
+    # repo's own confirmed fact is that zimmo.be runs a real Cloudflare
+    # Turnstile challenge (2026-08-22) -- without TWOCAPTCHA_KEY there is
+    # no way to clear it, so the live steps below are guarded on the
+    # secret's PRESENCE, checked through job env since `secrets` is not
+    # available in a job-level `if`.
+    env:
+      HAS_TWOCAPTCHA_KEY: ${{ secrets.TWOCAPTCHA_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.HAS_TWOCAPTCHA_KEY == 'true'
+
+      - name: Skip notice (no TWOCAPTCHA_KEY configured)
+        if: env.HAS_TWOCAPTCHA_KEY != 'true'
+        run: |
+          echo "::notice::Skipping the live canary run -- no TWOCAPTCHA_KEY secret is configured. \
+          zimmo.be runs a real Cloudflare Turnstile challenge (confirmed live 2026-08-22), and \
+          without a 2Captcha key there is no way to clear it. Add the TWOCAPTCHA_KEY repository \
+          secret to enable this canary."
+
+      - uses: actions/setup-python@v5
+        if: env.HAS_TWOCAPTCHA_KEY == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install core + Playwright
+        if: env.HAS_TWOCAPTCHA_KEY == 'true'
+        run: |
+          pip install -r requirements.txt -r requirements-playwright.txt
+          playwright install --with-deps chromium
+
+      - name: Run against a known-good filtered category, >=3 pages
+        if: env.HAS_TWOCAPTCHA_KEY == 'true'
+        env:
+          TWOCAPTCHA_KEY: ${{ secrets.TWOCAPTCHA_KEY }}
+          # The canary's proxy secret goes through the ENVIRONMENT, not a
+          # commented-out --proxy line (CLAUDE.md §11): an unset secret
+          # arrives here as an empty string, which env_config.py's own
+          # placeholder check treats as unset -- so this one line is
+          # correct whether or not ZIMMO_PROXY is actually configured,
+          # with no separate edit needed to "turn the proxy on".
+          ZIMMO_PROXY: ${{ secrets.ZIMMO_PROXY }}
+        run: |
+          # Retry the WHOLE run, not just individual page fetches
+          # (--retries already handles those) -- CONFIRMED LIVE
+          # 2026-09-15/16 that whether zimmo.be's Cloudflare Managed
+          # Challenge lets a request through is inconsistent run to
+          # run on the IDENTICAL configuration (see README's own
+          # "Honesty about what's confirmed live" section and
+          # scraper_api_client.py's module docstring for the dated
+          # history). A canary that fails on the site's own normal
+          # instability, not a real scraper bug, is exactly the
+          # "always red, so everyone ignores it" failure mode CLAUDE.md
+          # warns about -- so this canary retries a few times before
+          # actually reporting red.
+          for attempt in 1 2 3; do
+            echo "=== Canary attempt $attempt/3 ==="
+            python playwright_scraper.py \
+              --url "https://www.zimmo.be/nl/gent-9000/te-koop/" \
+              --pages 3 \
+              --format both \
+              --out canary_run \
+              --dump-html
+            code=$?
+            if [ -f canary_run.meta.json ]; then
+              status=$(python -c "import json; print(json.load(open('canary_run.meta.json'))['status'])")
+              if [ "$status" = "complete" ]; then
+                echo "Attempt $attempt: complete -- stopping retries."
+                break
+              fi
+              echo "Attempt $attempt: status=$status (exit $code) -- will retry if attempts remain."
+            else
+              echo "Attempt $attempt: no output written at all (exit $code) -- will retry if attempts remain."
+            fi
+            sleep 30
+          done
+
+      - name: Assert the run actually succeeded
+        if: env.HAS_TWOCAPTCHA_KEY == 'true'
+        run: |
+          python -c "
+          import json, sys
+
+          with open('canary_run.meta.json') as f:
+              meta = json.load(f)
+
+          print('status:', meta['status'])
+          print('pages_completed:', meta['pages_completed'], '/', meta['pages_requested'])
+          print('product_count:', meta['product_count'])
+
+          # NOT requiring status == 'complete' or every page to have
+          # completed (CONFIRMED LIVE 2026-09-15/16: a single genuinely
+          # blocked page among three, on an otherwise-healthy run, is
+          # the site's own normal behaviour, not a scraper regression --
+          # see this workflow's own retry loop above and README's
+          # 'Honesty about what's confirmed live' section). 'blocked'
+          # with zero products is the one status this run's own retry
+          # loop could not recover from in 3 attempts, and DOES still
+          # fail here -- that is a real, actionable red canary.
+          assert meta['status'] in ('complete', 'partial'), f\"expected complete or partial, got {meta['status']!r}\"
+          assert meta['pages_completed'] >= 1, 'not even page 1 completed across 3 retries'
+          assert meta['product_count'] >= 10, f\"product floor not met: {meta['product_count']} < 10\"
+
+          with open('canary_run.json') as f:
+              products = json.load(f)
+          priced = sum(1 for p in products if p.get('price') is not None)
+          price_share = priced / len(products)
+          print('non-null price share:', f'{price_share:.0%}')
+          assert price_share >= 0.9, f'too many listings with no price at all: {price_share:.0%}'
+
+          print('Canary: PASS')
+          "
+
+      - name: Upload artefacts (every run, pass or fail)
+        if: always() && env.HAS_TWOCAPTCHA_KEY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-run-${{ github.run_id }}
+          path: |
+            canary_run.json
+            canary_run.csv
+            canary_run.meta.json
+            canary_run_page*_debug.html
+            canary_run_page*_debug.png
+          retention-days: 14

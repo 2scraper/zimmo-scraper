@@ -1,0 +1,161 @@
+name: tests
+
+# Offline only (CLAUDE.md §11) — nothing here touches zimmo.be or a
+# credential. See canary.yml for the one real live run.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Oldest and newest supported Python — claiming 3.9 without
+        # testing it is how a walrus operator ships (CLAUDE.md §11).
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install core requirements
+        run: pip install -r requirements.txt
+
+      - name: Byte-compile every module
+        run: python -m compileall -q .
+
+      - name: --help works for every CLI
+        run: |
+          for script in playwright_scraper.py puppeteer_scraper.py selenium_scraper.py \
+                        scraper_api_client.py diff_runs.py; do
+            echo "=== $script --help ==="
+            python "$script" --help
+          done
+          python env_config.py
+
+      - name: Smoke test (banned wording, .env.example, flag/signature consistency, parser/output logic)
+        run: python smoke_test.py
+
+      - name: pytest entry point
+        run: |
+          pip install pytest
+          python -m pytest tests/ -v
+
+      - name: sample_output columns match the Product dataclass
+        run: |
+          python -c "
+          import json, csv
+          from dataclasses import fields
+          from output_writer import Product
+
+          expected = [f.name for f in fields(Product)]
+
+          with open('sample_output.json') as f:
+              rows = json.load(f)
+          assert rows, 'sample_output.json must have at least one row'
+          for row in rows:
+              assert list(row.keys()) == expected, f'sample_output.json field order mismatch: {list(row.keys())} != {expected}'
+
+          with open('sample_output.csv', newline='') as f:
+              header = next(csv.reader(f))
+          assert header == expected, f'sample_output.csv header mismatch: {header} != {expected}'
+          print('sample_output.{json,csv} match the Product dataclass exactly.')
+          "
+
+      - name: No committed credentials (one implementation, shared with the offline suite)
+        run: python3 check_no_credentials.py
+
+  engine-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        engine: [playwright, puppeteer, selenium]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # One venv per engine, installed from its OWN requirements file
+      # (CLAUDE.md §11) — a single shared environment lets pip silently
+      # resolve the family's mutually-unsatisfiable pins by reaching
+      # for whatever it can, which stays green against a version
+      # nobody ships.
+      - name: Create venv and install this engine only
+        run: |
+          python -m venv .venv-${{ matrix.engine }}
+          source .venv-${{ matrix.engine }}/bin/activate
+          pip install -r requirements.txt -r requirements-${{ matrix.engine }}.txt
+          pip check
+
+      - name: Install browser (Playwright only)
+        if: matrix.engine == 'playwright'
+        run: |
+          source .venv-playwright/bin/activate
+          playwright install --with-deps chromium
+
+      - name: Confirm THIS engine's module-level driver import does not skip
+        run: |
+          source .venv-${{ matrix.engine }}/bin/activate
+          python -c "
+          import ast
+          script_name = '${{ matrix.engine }}_scraper.py'
+          driver_name = {'playwright': 'playwright', 'puppeteer': 'pyppeteer', 'selenium': 'selenium'}['${{ matrix.engine }}']
+          tree = ast.parse(open(script_name).read())
+          found = any(driver_name in ast.dump(n) for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)))
+          assert found, f'{driver_name} is not imported at module level -- a real ImportError would be silently swallowed'
+          print(f'{driver_name} imported at module level: confirmed.')
+          "
+          python ${{ matrix.engine }}_scraper.py --help
+
+  docker-build:
+    runs-on: ubuntu-latest
+    # "Build the Docker image in CI. Nothing else does, which is how
+    # all three [sibling] repos shipped a broken one." (CLAUDE.md §11)
+    # Four steps, each catching a DISTINCT failure a manual COPY-list
+    # review cannot: the image builds; its entrypoint actually runs;
+    # Chromium actually launches (not just `playwright install
+    # --with-deps` exiting 0); and the image is free of anything that
+    # should never leave a developer's machine.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t zimmo-scraper:ci .
+
+      - name: Entrypoint runs (the CMD is --help, the exact invocation a missing module breaks)
+        run: docker run --rm zimmo-scraper:ci --help
+
+      - name: Chromium really launches inside the image
+        run: |
+          docker run --rm zimmo-scraper:ci --url "https://example.invalid/" --pages 1 2>&1 | tee /tmp/launch_check.log || true
+          # A real Chromium launch failure prints its own distinctive
+          # error text; a DNS failure on the bogus URL above (expected
+          # and fine) proves Chromium got far enough to attempt
+          # navigation, which is the thing this step exists to prove.
+          if grep -qi "Executable doesn't exist\|Host system is missing dependencies" /tmp/launch_check.log; then
+            echo "Chromium failed to launch inside the image -- see log above."
+            exit 1
+          fi
+          echo "Chromium launched (reached a navigation attempt) inside the image."
+
+      - name: Image contains no .env, no test suite, no fixtures
+        run: |
+          docker create --name zimmo-check zimmo-scraper:ci --help
+          FOUND=0
+          for forbidden in .env tests sample_output.json sample_output.csv README.md CLAUDE.md; do
+            if docker cp zimmo-check:/app/$forbidden /tmp/should-not-exist 2>/dev/null; then
+              echo "FORBIDDEN: /app/$forbidden exists inside the image"
+              rm -rf /tmp/should-not-exist
+              FOUND=1
+            fi
+          done
+          docker rm zimmo-check
+          if [ "$FOUND" = "1" ]; then
+            echo "A .env baked into an image is a credential published to everyone who can pull it."
+            exit 1
+          fi
+          echo "Confirmed: no .env, test suite, or fixtures inside the image."
