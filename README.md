@@ -4,7 +4,7 @@
 ![tests](https://img.shields.io/github/actions/workflow/status/2scraper/zimmo-scraper/tests.yml?branch=main&label=tests)
 ![canary](https://img.shields.io/github/actions/workflow/status/2scraper/zimmo-scraper/canary.yml?branch=main&label=canary)
 ![python](https://img.shields.io/badge/python-3.9%E2%80%933.12-blue)
-![license](https://img.shields.io/github/license/2scraper/zimmo-scraper)
+![license](https://img.shields.io/github/license/2scraper/zimmo-scraper?cacheSeconds=3600)
 ![engines](https://img.shields.io/badge/engines-Playwright%20%7C%20Selenium%20%7C%20Puppeteer-informational)
 ![no account needed](https://img.shields.io/badge/runs%20without%20an%20account-yes-success)
 
