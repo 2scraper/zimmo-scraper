@@ -27,10 +27,19 @@ jobs:
       - name: Byte-compile every module
         run: python -m compileall -q .
 
-      - name: --help works for every CLI
+      # Only the engine-INDEPENDENT CLIs belong here. The three
+      # *_scraper.py entry points import their driver at module level
+      # on purpose -- the engine-smoke job below asserts exactly that,
+      # because a lazily-imported driver turns a real ImportError into
+      # a silent skip. That deliberate choice means their --help cannot
+      # run in this job, which installs requirements.txt only (the
+      # three engine requirement files are mutually unsatisfiable in
+      # one environment; see requirements.txt's own header). Their
+      # --help IS covered, per engine, in engine-smoke's own venv; the
+      # compileall step above is what covers their syntax on 3.9.
+      - name: --help works for every engine-independent CLI
         run: |
-          for script in playwright_scraper.py puppeteer_scraper.py selenium_scraper.py \
-                        scraper_api_client.py diff_runs.py; do
+          for script in scraper_api_client.py diff_runs.py; do
             echo "=== $script --help ==="
             python "$script" --help
           done
