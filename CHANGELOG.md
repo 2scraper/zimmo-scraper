@@ -52,6 +52,17 @@ here rather than treated as a violation of the format.
   session died with "session not created" — reported as exit 5. Replaced
   by Selenium Manager, built into `selenium>=4.6`, which matches the
   installed browser; the `webdriver-manager` dependency is gone.
+- **The Scraper API path failed on every call, and was billed for it.**
+  The live API now requires `waitFor` as an object and answered the
+  JSON-encoded string this client sent with HTTP 422 "params.waitFor must
+  be an object" ($0.0005 each). It also reports the target's status in
+  `http_code`, while `status` is its own "success" — which the client
+  compared with 400 and would have raised `TypeError` on. Both fixed;
+  measured after the fix: 21 rows, exit 0.
+- **Exit 5 for a run that never obtained a page.** Zero rows with every
+  attempted page failed (a dead proxy, a load timeout) reported exit 4,
+  "the catalogue is empty". It is now 5, "the content was never
+  obtained", as across the family since 2026-09-21.
 - **The banned-wording check read only `.py` files**, so the README
   tagline and the package description both used a phrase it bans. It
   now scans the published text files too (README, pyproject, workflows,
@@ -61,6 +72,15 @@ here rather than treated as a violation of the format.
 - `canary.yml` runs headful under xvfb, takes its proxy from a
   `ZIMMO_PROXY` secret when one is set, and asserts column shares
   (living area, bedrooms, EPC, property type), not only a row count.
+  Dispatched once on this branch with no secret: GitHub's runner was
+  refused (exit 3) and the job ended in its `::notice::`, as designed —
+  so until a `ZIMMO_PROXY` secret exists, green means "refused as
+  documented", not "tested".
+- The README's "What you need" section replaces the old "Honesty"
+  section, which contradicted itself on the Scraper API and still
+  described an embedded-JSON path the site removed on 2026-09-15.
+- The Scraping Browser example keeps its endpoint in `.env`; it used to
+  put a password on the command line.
 
 ## [1.0.0] — Stable public interface (2026-09-18)
 

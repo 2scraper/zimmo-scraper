@@ -220,6 +220,16 @@ def main() -> int:
                     and not os.path.exists(zero_prefix + ".csv")
                     and not os.path.exists(zero_prefix + ".meta.json"))
 
+        from output_writer import EXIT_FETCH_FAILED
+        never_prefix = os.path.join(tmp, "never_obtained_run")
+        code_never = finish_run([], never_prefix, "both", pages_requested=3, pages_completed=0,
+                                failed_pages=[1], unattempted_pages=[2, 3], allow_empty=True)
+        ok &= check("0 rows because no page was ever FETCHED is exit 5, not 4 -- even with "
+                    "--allow-empty, and with nothing written (CLAUDE.md §25)",
+                    code_never == EXIT_FETCH_FAILED == 5
+                    and not os.path.exists(never_prefix + ".json")
+                    and not os.path.exists(never_prefix + ".meta.json"))
+
         allow_empty_prefix = os.path.join(tmp, "allow_empty_run")
         code2 = finish_run([], allow_empty_prefix, "both", pages_requested=1, pages_completed=1, allow_empty=True)
         ok &= check("zero products + --allow-empty DOES write (explicit opt-out honoured)",
@@ -267,11 +277,9 @@ def main() -> int:
 
     print()
     if ok:
-        print("All smoke tests passed. Core logic is internally consistent —")
-        print("but see product_parser.py's module docstring: the properties-JSON")
-        print("path is confirmed live; JSON-LD and the CSS fallback are not, since")
-        print("the properties path has always been present so far. Run a real")
-        print("browser test next if either fallback is ever actually exercised.")
+        print("All smoke tests passed. Offline only: the live site is exercised by")
+        print("canary.yml, and it needs a residential exit plus a headful browser")
+        print("(README, 'What you need').")
         return 0
     else:
         print("Some checks FAILED — fix these before running against a real browser/site.")
