@@ -8,9 +8,9 @@
 ![engines](https://img.shields.io/badge/engines-Playwright%20%7C%20Selenium%20%7C%20Puppeteer-informational)
 ![no account needed](https://img.shields.io/badge/runs%20without%20an%20account-yes-success)
 
-Zimmo.be real-estate listing-page scraper (Playwright, Selenium, Puppeteer,
-or a cloud browser via CDP) — embedded-JSON parsing, Cloudflare Turnstile /
-reCAPTCHA v3 solving, proxies, fingerprints.
+Zimmo.be real-estate listing scraper (Playwright, Selenium, Puppeteer, or
+the 2Captcha Scraping Browser API via CDP) — sale and rent listings, prices,
+living area, bedrooms, EPC labels, proxies, captcha solving.
 
 ---
 

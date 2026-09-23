@@ -7,6 +7,61 @@ manage. A patch release means "fixes" — not that every flag is frozen,
 so a behaviour-changing default landing in a patch is stated plainly
 here rather than treated as a violation of the format.
 
+## [1.1.0] — Measured against today's site (2026-09-23)
+
+> **Output changes for existing users.** Listings whose price reads
+> "Prijs op aanvraag" / "Prix sur demande" are now ROWS, with `price`
+> and `currency` both null — before, they were silently dropped. And
+> `bedrooms`, `epc_label` and `property_type`, which were null on every
+> row of every run since zimmo.be's Angular redesign, are now filled.
+> No flag and no column changed.
+
+> **Correction to 1.0.0's "no account needed" promise.** It is still
+> true that no 2Captcha key is required. It is not true that nothing is:
+> measured 2026-09-23, zimmo.be serves listings to a **residential exit
+> with a headful browser**, and refuses headless Chromium (even from a
+> Belgian home address) and any datacentre address. The README now says
+> so, with the measurements. The 2Captcha Scraping Browser API also
+> works (Belgian exit, 3 of 3 pages).
+
+> **The "daily canary" 1.0.0 cited never ran.** It was gated on a
+> `TWOCAPTCHA_KEY` secret that was never set, so every run took the
+> skip branch and the badge read green without touching the site.
+
+### Fixed
+- **Parser, on the markup the site serves today** (NL and FR, sale and
+  rent; checked field by field against the tiles' own labels on 105
+  tiles over 7 live pages, 0 mismatches):
+  - each listing is scoped by its own `<zimmo-listing>` element instead
+    of by walking up until a price appears, which is what dropped
+    price-on-request listings;
+  - `bedrooms`, living area and the energy grade are read from the
+    tile's feature ICONS, which are the same in both languages — EPC
+    (Flanders, Wallonia) and Brussels' EPB alike; `epc_x.svg` (no grade)
+    stays null rather than becoming a letter;
+  - areas are read the Belgian way: "2.578 vierkante meter" is 2,578 m²,
+    not 2.578;
+  - `surface_m2` is the LIVING area only — a shop's commercial surface
+    or a plot area is no longer written into it;
+  - `property_type` and `listing_type` come from the URL segment
+    (`/te-koop/huis/…`, `/a-louer/…`), so a new-build project whose
+    title carries no sale word is no longer `listing_type: null`.
+- **Selenium never started on a machine whose Chromium was not the newest
+  Chrome.** `webdriver-manager` downloaded the latest chromedriver for
+  Google Chrome (154) against an installed Chromium 152, and every
+  session died with "session not created" — reported as exit 5. Replaced
+  by Selenium Manager, built into `selenium>=4.6`, which matches the
+  installed browser; the `webdriver-manager` dependency is gone.
+- **The banned-wording check read only `.py` files**, so the README
+  tagline and the package description both used a phrase it bans. It
+  now scans the published text files too (README, pyproject, workflows,
+  `.env.example`, Dockerfile, CONTRIBUTING, SECURITY).
+
+### Changed
+- `canary.yml` runs headful under xvfb, takes its proxy from a
+  `ZIMMO_PROXY` secret when one is set, and asserts column shares
+  (living area, bedrooms, EPC, property type), not only a row count.
+
 ## [1.0.0] — Stable public interface (2026-09-18)
 
 No change to what the scraper does. This release is a commitment about

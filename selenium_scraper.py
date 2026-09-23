@@ -26,7 +26,7 @@ Usage
         --url "https://www.zimmo.be/nl/gent-9000/te-koop/" \\
         --pages 3 --format both
 
-Requires: pip install selenium webdriver-manager beautifulsoup4 requests --break-system-packages
+Requires: pip install selenium beautifulsoup4 requests --break-system-packages
 """
 
 import argparse
@@ -41,11 +41,9 @@ from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 
 from captcha_solver import (
     detect_recaptcha_v3, solve_recaptcha_v3, detect_cloudflare_challenge,
@@ -120,8 +118,13 @@ def build_driver(args, proxy_server_only: Optional[str] = None) -> webdriver.Chr
     if proxy_server_only:
         options.add_argument(f"--proxy-server={proxy_server_only}")
 
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+    # Selenium Manager (built into selenium>=4.6) resolves a chromedriver
+    # that matches the browser actually installed. webdriver-manager, used
+    # here until 2026-09-23, fetched the LATEST chromedriver for Google
+    # Chrome instead: on a machine with Chromium 152 it downloaded 154 and
+    # every session died with "This version of ChromeDriver only supports
+    # Chrome version 154" -- reported as exit 5 on every run.
+    driver = webdriver.Chrome(options=options)
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     })
