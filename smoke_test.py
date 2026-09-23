@@ -220,6 +220,16 @@ def main() -> int:
                     and not os.path.exists(zero_prefix + ".csv")
                     and not os.path.exists(zero_prefix + ".meta.json"))
 
+        from output_writer import EXIT_FETCH_FAILED
+        never_prefix = os.path.join(tmp, "never_obtained_run")
+        code_never = finish_run([], never_prefix, "both", pages_requested=3, pages_completed=0,
+                                failed_pages=[1], unattempted_pages=[2, 3], allow_empty=True)
+        ok &= check("0 rows because no page was ever FETCHED is exit 5, not 4 -- even with "
+                    "--allow-empty, and with nothing written (CLAUDE.md §25)",
+                    code_never == EXIT_FETCH_FAILED == 5
+                    and not os.path.exists(never_prefix + ".json")
+                    and not os.path.exists(never_prefix + ".meta.json"))
+
         allow_empty_prefix = os.path.join(tmp, "allow_empty_run")
         code2 = finish_run([], allow_empty_prefix, "both", pages_requested=1, pages_completed=1, allow_empty=True)
         ok &= check("zero products + --allow-empty DOES write (explicit opt-out honoured)",
@@ -267,11 +277,9 @@ def main() -> int:
 
     print()
     if ok:
-        print("All smoke tests passed. Core logic is internally consistent —")
-        print("but see product_parser.py's module docstring: the properties-JSON")
-        print("path is confirmed live; JSON-LD and the CSS fallback are not, since")
-        print("the properties path has always been present so far. Run a real")
-        print("browser test next if either fallback is ever actually exercised.")
+        print("All smoke tests passed. Offline only: the live site is exercised by")
+        print("canary.yml, and it needs a residential exit plus a headful browser")
+        print("(README, 'What you need').")
         return 0
     else:
         print("Some checks FAILED — fix these before running against a real browser/site.")
@@ -302,23 +310,42 @@ _SHIPPED_PY_FILES = (
     # data to check against, so scanning this file would always flag
     # itself -- a self-reference, not a real violation.
 )
+# The text a reader actually sees. Until 2026-09-23 only the .py files
+# above were scanned, so the README's own tagline and pyproject.toml's
+# package description both carried the first banned phrase under a green
+# suite (CLAUDE.md §21: a wording check must cover what the repo
+# PUBLISHES). CHANGELOG.md is left out on purpose: its released sections
+# are history (§19), and two of them name removed features in order to
+# say they were removed.
+_SHIPPED_TEXT_FILES = (
+    "README.md", "pyproject.toml", ".env.example", "Dockerfile",
+    "CONTRIBUTING.md", "SECURITY.md",
+    ".github/workflows/tests.yml", ".github/workflows/canary.yml",
+)
 
 
 def check_banned_wording() -> bool:
     ok = True
     this_dir = os.path.dirname(os.path.abspath(__file__))
-    for filename in _SHIPPED_PY_FILES:
+    scanned = 0
+    for filename in _SHIPPED_PY_FILES + _SHIPPED_TEXT_FILES:
         path = os.path.join(this_dir, filename)
         if not os.path.isfile(path):
-            continue  # a file not present yet in a partial checkout -- not this test's job
+            # a partial checkout, or the Docker image, which COPYs no
+            # README/.github -- not this test's job
+            continue
+        scanned += 1
         with open(path, "r", encoding="utf-8") as f:
             content = f.read().lower()
         for phrase in _BANNED_PHRASES:
             if phrase in content:
                 print(f"[FAIL] banned phrase {phrase!r} found in {filename}")
                 ok = False
+    if scanned == 0:
+        print("[FAIL] banned-wording check scanned no files at all")
+        return False
     if ok:
-        print(f"[PASS] no banned wording found across {len(_SHIPPED_PY_FILES)} shipped files")
+        print(f"[PASS] no banned wording found across {scanned} shipped files")
     return ok
 
 
@@ -489,6 +516,68 @@ def check_css_fallback_widened_scope_is_used() -> bool:
           "sibling div, not the anchor's own immediate parent) and extracts sku/title/"
           "location precisely from confirmed-live Angular tile markup")
     return True
+
+
+# Six real <zimmo-listing> tiles, cut from live captures taken
+# 2026-09-23 through a Belgian residential exit (gent-9000/te-koop pages
+# 1-3, antwerpen-2000/te-huur, bruxelles-1000/a-vendre), trimmed of SVG
+# paths, Angular attributes and the favourite button. The trimmed fixture
+# was checked to parse to the same rows as the untrimmed tiles. Each tile
+# is here for one case the site really serves:
+#   LRZLA  NL sale, bedrooms + EPC icon, no living area stated
+#   LR7M2  living area written "2.578" (thousands, not 2.578 m2), EPC A+
+#   KLQRM  "Prijs op aanvraag" -- a real listing with no price at all
+#   LRZ2M  only a COMMERCIAL surface, which is not a living area
+#   LRZK9  French page, Brussels' EPB energy scheme instead of EPC
+#   KRBP7  epc_x.svg -- a listing with no energy grade
+LIVE_ANGULAR_TILES_HTML = r'''
+<zimmo-listing _ngcontent-ng-c1732943450="" _nghost-ng-c3516730="" class="" ngh="19" style="order: 0;" zimmointersectionobserver=""><article><div class="infobox_photo"><img alt="Huis te koop in Zwijnaardsesteenweg 685,
+ 9000 Gent" class="main-image" height="618" src="https://files.zimmo.be/backend-api/qMbJs7nn9uXzLU5aLtWl6XQOLD0=/828x618/filters:image-format(pjpg)/-/real-estate/customers/b4e045de-4bae-11e9-922b-005056b768a1/dealers/d8334a31-1f5c-4c08-994d-b0a3d6a03f65/listings/52a68ae4-88dc-4c2a-8885-e215155beb7a/images/01a0ce69-9587-7761-9b6a-30c604f1d540" width="828"/><div class="header"><div class="sticker"><span>Nieuw</span></div></div><div class="logo"><img alt="Joost EEMAN logo" src="/assets/@listings/icons/biddit.svg" title="Joost EEMAN logo"/></div></div><div class="infobox_content"><h2><a href="/nl/gent-9000/te-koop/huis/LRZLA"><span class="title">Huis te koop<span class="zimmo-code">LRZLA</span></span><address> Zwijnaardsesteenweg 685 <br/> 9000 Gent </address></a></h2><div class="price"><div class="amount"><svg-icon data-src="assets/@listings/icons/bidditb.svg"></svg-icon><span>€ 210.000</span></div></div><div class="features"><div class="features_item"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/clock.svg" role="presentation" src="/assets/@listings/features/clock.svg"></svg-icon><svg-icon class="value" data-src="/assets/@listings/icons/lock.svg" src="/assets/@listings/icons/lock.svg"></svg-icon></div><div aria-label="Het aantal slaapkamers is 3" class="features_item" role="img"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/bedrooms.svg" role="presentation"></svg-icon><span aria-hidden="true" class="value">3</span></div><div class="features_energy"><svg-icon data-src="/assets/@listings/energy-labels/epc_f.svg"></svg-icon></div></div></div></article></zimmo-listing><zimmo-listing _ngcontent-ng-c1732943450="" _nghost-ng-c3516730="" class="" ngh="30" style="order: 40;" zimmointersectionobserver=""><article><div class="infobox_photo"><img alt="Bedrijfsvastgoed te koop in Raymonde de Larochelaan 50,
+ 9000 Gent" class="main-image" height="618" src="https://files.zimmo.be/backend-api/q4c6J2efEjQ-8HM34cAzWFv5JFg=/828x618/filters:image-format(pjpg)/-/real-estate/customers/b51c1823-4bae-11e9-922b-005056b768a1/dealers/b31369f3-62f9-4cca-96ef-b8652bdde916/listings/779606b7-3528-42b5-864c-f04017842d73/images/01a033c1-ab46-7ec5-9c14-340a64a1def6" width="828"/><div class="header"><div class="sticker"></div></div><div class="logo"><img alt="PANORAMA B2B Gent kantoren logo" src="https://files.zimmo.be/backend-api/x12STQmtgb4wwt-IHHtL9s3TDOw=/filters:image-format(pjpg)/-/real-estate/customers/b51c1823-4bae-11e9-922b-005056b768a1/logos/01995d00-92f6-7412-b6ea-6258f0d09b91" title="PANORAMA B2B Gent kantoren logo"/></div></div><div class="infobox_content"><h2><a href="/nl/gent-9000/te-koop/bedrijfsvastgoed/LR7M2"><span class="title">Bedrijfsvastgoed te koop<span class="zimmo-code">LR7M2</span></span><address> Raymonde de Larochelaan 50 <br/> 9000 Gent </address></a></h2><div class="price"><div class="amount"><span>€ 9.280.800</span></div></div><div class="features"><div class="features_item"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/clock.svg" role="presentation" src="/assets/@listings/features/clock.svg"></svg-icon><svg-icon class="value" data-src="/assets/@listings/icons/lock.svg" src="/assets/@listings/icons/lock.svg"></svg-icon></div><div aria-label="De woonoppervlakte is 2.578 vierkante meter" class="features_item" role="img"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/floorspace-surface.svg" role="presentation"></svg-icon><span aria-hidden="true" class="value">2.578m²</span></div><div class="features_energy"><svg-icon data-src="/assets/@listings/energy-labels/epc_a_plus.svg"></svg-icon></div></div></div></article></zimmo-listing><zimmo-listing _ngcontent-ng-c1732943450="" _nghost-ng-c3516730="" class="show-extra-photos" ngh="24" style="order: 10;" zimmointersectionobserver=""><article><div class="infobox_photo"><img alt="Bedrijfsvastgoed te huur in Noorderplaats 5-9,
+ 2000 Antwerpen" class="main-image" height="618" src="https://files.zimmo.be/backend-api/Yeq2UCeGqvXE-Gs0afaYDBlsC8M=/828x618/filters:image-format(pjpg)/-/real-estate/customers/b4f9b016-4bae-11e9-922b-005056b768a1/dealers/523ce871-2114-4928-ad1d-bbff4710b20c/listings/f9e8040a-114f-4d8f-addb-b9c8106d768d/images/019f2f9f-31eb-7a0e-a031-b1f83b7a7994" width="828"/><div class="header"><div class="sticker"></div></div><div class="logo __premium"><div class="logo_premium-label">Premium partner</div><img alt="Oreon Properties Herentals logo" src="https://files.zimmo.be/backend-api/CptRHtEnttr2_YVCJRefSBGHpGw=/filters:image-format(pjpg)/-/real-estate/customers/b4f9b016-4bae-11e9-922b-005056b768a1/logos/01995d00-6da7-7e8d-b17d-05b4a0af9ca1" title="Oreon Properties Herentals logo"/></div></div><div class="premium-photos"><div class="premium-photos_item"><img alt="" role="presentation" src="https://files.zimmo.be/backend-api/xehzxY78-k92wPOIcn7PdEvZNsw=/828x618/filters:image-format(pjpg)/-/real-estate/customers/b4f9b016-4bae-11e9-922b-005056b768a1/dealers/523ce871-2114-4928-ad1d-bbff4710b20c/listings/f9e8040a-114f-4d8f-addb-b9c8106d768d/images/019f2f9f-33fe-7aec-b38d-1a5deed2fb52"/></div><div class="premium-photos_item"><img alt="" role="presentation" src="https://files.zimmo.be/backend-api/z5zcg0HmowHawNOX_uYECEYaA5A=/828x618/filters:image-format(pjpg)/-/real-estate/customers/b4f9b016-4bae-11e9-922b-005056b768a1/dealers/523ce871-2114-4928-ad1d-bbff4710b20c/listings/f9e8040a-114f-4d8f-addb-b9c8106d768d/images/019f2f9f-369b-7770-b180-7ca831f6f71a"/><div class="logo __premium"><div class="logo_premium-label">Premium partner</div><img alt="Oreon Properties Herentals logo" src="https://files.zimmo.be/backend-api/CptRHtEnttr2_YVCJRefSBGHpGw=/filters:image-format(pjpg)/-/real-estate/customers/b4f9b016-4bae-11e9-922b-005056b768a1/logos/01995d00-6da7-7e8d-b17d-05b4a0af9ca1" title="Oreon Properties Herentals logo"/></div></div></div><div class="infobox_content"><h2><a href="/nl/antwerpen-2000/te-huur/bedrijfsvastgoed/KLQRM"><span class="title">Bedrijfsvastgoed te huur<span class="zimmo-code">KLQRM</span></span><address> Noorderplaats 5-9 <br/> 2000 Antwerpen </address></a></h2><div class="price"><div class="amount"><span>Prijs op aanvraag</span></div></div><div class="features"><div class="features_item"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/clock.svg" role="presentation" src="/assets/@listings/features/clock.svg"></svg-icon><svg-icon class="value" data-src="/assets/@listings/icons/lock.svg" src="/assets/@listings/icons/lock.svg"></svg-icon></div><div aria-label="De woonoppervlakte is 537 vierkante meter" class="features_item" role="img"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/floorspace-surface.svg" role="presentation"></svg-icon><span aria-hidden="true" class="value">537m²</span></div></div></div></article></zimmo-listing><zimmo-listing _ngcontent-ng-c1732943450="" _nghost-ng-c3516730="" class="" ngh="22" style="order: 4;" zimmointersectionobserver=""><article><div class="infobox_photo"><img alt="Bedrijfsvastgoed te huur in Meir 30 bus V3+4,
+ 2000 Antwerpen" class="main-image" height="618" src="https://files.zimmo.be/backend-api/OLjaHKcOboVRooDrtd3usgAw4vU=/828x618/filters:image-format(pjpg)/-/real-estate/customers/b4d4fa0b-4bae-11e9-922b-005056b768a1/dealers/0402eff7-59a5-4696-a6d4-4391499dc7e0/listings/b0dc0a30-ea3c-46b4-baa9-6e647320c72f/images/01a0cd28-c507-7279-8312-3ac92114236a" width="828"/><div class="header"><div class="sticker"><span>Nieuw</span></div></div><div class="logo"></div></div><div class="infobox_content"><h2><a href="/nl/antwerpen-2000/te-huur/bedrijfsvastgoed/LRZ2M"><span class="title">Bedrijfsvastgoed te huur<span class="zimmo-code">LRZ2M</span></span><address> Meir 30 bus V3+4 <br/> 2000 Antwerpen </address></a></h2><div class="price"><div class="amount"><span>€ 16.249</span></div></div><div class="features"><div class="features_item"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/clock.svg" role="presentation" src="/assets/@listings/features/clock.svg"></svg-icon><svg-icon class="value" data-src="/assets/@listings/icons/lock.svg" src="/assets/@listings/icons/lock.svg"></svg-icon></div><div aria-label="De handelsoppervlakte is 1.258 vierkante meter" class="features_item" role="img"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/commercial-surface.svg" role="presentation"></svg-icon><span aria-hidden="true" class="value">1.258m²</span></div><div class="features_energy"><svg-icon data-src="/assets/@listings/energy-labels/epc_b.svg"></svg-icon></div></div></div></article></zimmo-listing><zimmo-listing _ngcontent-ng-c1732943450="" _nghost-ng-c3516730="" class="" ngh="19" style="order: 0;" zimmointersectionobserver=""><article><div class="infobox_photo"><img alt="Appartement à vendre à ,
+ 1050 Ixelles" class="main-image" height="618" src="https://files.zimmo.be/backend-api/r6LuaXXm6Ot_djwN7YN01RCXzSI=/828x618/filters:image-format(pjpg)/-/real-estate/customers/b53097eb-4bae-11e9-922b-005056b768a1/dealers/5130f9eb-e89d-463c-9918-810c8cd6b6b7/listings/8dff6a47-0e50-453d-8d4d-ae6eb4bb698b/images/01a0ce56-aff3-7278-af27-be306254ea21" width="828"/><div class="header"><div class="sticker"><span>Nouveau</span></div></div><div class="logo"></div></div><div class="infobox_content"><h2><a href="/fr/bruxelles-1000/a-vendre/appartement/LRZK9"><span class="title">Appartement à vendre<span class="zimmo-code">LRZK9</span></span><address> Adresse sur demande <br/> 1050 Ixelles </address></a></h2><div class="price"><div class="amount"><span>€ 550.000</span></div></div><div class="features"><div class="features_item"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/clock.svg" role="presentation" src="/assets/@listings/features/clock.svg"></svg-icon><svg-icon class="value" data-src="/assets/@listings/icons/lock.svg" src="/assets/@listings/icons/lock.svg"></svg-icon></div><div aria-label="Le nombre de chambres est de 2" class="features_item" role="img"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/bedrooms.svg" role="presentation"></svg-icon><span aria-hidden="true" class="value">2</span></div><div aria-label="La surface habitable est de 140 mètres carrés" class="features_item" role="img"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/floorspace-surface.svg" role="presentation"></svg-icon><span aria-hidden="true" class="value">140m²</span></div><div class="features_energy"><svg-icon data-src="/assets/@listings/energy-labels/epb_f.svg"></svg-icon></div></div></div></article></zimmo-listing><zimmo-listing _ngcontent-ng-c1732943450="" _nghost-ng-c3516730="" class="show-extra-photos" ngh="25" style="order: 12;" zimmointersectionobserver=""><article><div class="infobox_photo"><img alt="Bedrijfsvastgoed te huur in Oudeleeuwenrui 13,
+ 2000 Antwerpen" class="main-image" height="618" src="https://files.zimmo.be/backend-api/H1xoGvHaymgqT4ihyMc7XOpBAs0=/828x618/filters:image-format(pjpg)/-/real-estate/customers/b4f9b016-4bae-11e9-922b-005056b768a1/dealers/523ce871-2114-4928-ad1d-bbff4710b20c/listings/08512cb8-2cb8-4047-8afb-f2f0bcb109af/images/019db7a7-8ce7-7286-a861-af96552800ff" width="828"/><div class="header"><div class="sticker"></div></div><div class="logo __premium"><div class="logo_premium-label">Premium partner</div><img alt="Oreon Properties Herentals logo" src="https://files.zimmo.be/backend-api/CptRHtEnttr2_YVCJRefSBGHpGw=/filters:image-format(pjpg)/-/real-estate/customers/b4f9b016-4bae-11e9-922b-005056b768a1/logos/01995d00-6da7-7e8d-b17d-05b4a0af9ca1" title="Oreon Properties Herentals logo"/></div></div><div class="premium-photos"><div class="premium-photos_item"><img alt="" role="presentation" src="https://files.zimmo.be/backend-api/f0RYREY0mN-4CUxkOm9n1QalAg8=/828x618/filters:image-format(pjpg)/-/real-estate/customers/b4f9b016-4bae-11e9-922b-005056b768a1/dealers/523ce871-2114-4928-ad1d-bbff4710b20c/listings/08512cb8-2cb8-4047-8afb-f2f0bcb109af/images/019db7a7-8edb-7610-9671-8eeffc8386d2"/></div><div class="premium-photos_item"><img alt="" role="presentation" src="https://files.zimmo.be/backend-api/kb0ckUuE9cdLT1pj-inUE8W2ek4=/828x618/filters:image-format(pjpg)/-/real-estate/customers/b4f9b016-4bae-11e9-922b-005056b768a1/dealers/523ce871-2114-4928-ad1d-bbff4710b20c/listings/08512cb8-2cb8-4047-8afb-f2f0bcb109af/images/019db7a7-90fe-777a-b9c3-bb1827e55f3a"/><div class="logo __premium"><div class="logo_premium-label">Premium partner</div><img alt="Oreon Properties Herentals logo" src="https://files.zimmo.be/backend-api/CptRHtEnttr2_YVCJRefSBGHpGw=/filters:image-format(pjpg)/-/real-estate/customers/b4f9b016-4bae-11e9-922b-005056b768a1/logos/01995d00-6da7-7e8d-b17d-05b4a0af9ca1" title="Oreon Properties Herentals logo"/></div></div></div><div class="infobox_content"><h2><a href="/nl/antwerpen-2000/te-huur/bedrijfsvastgoed/KRBP7"><span class="title">Bedrijfsvastgoed te huur<span class="zimmo-code">KRBP7</span></span><address> Oudeleeuwenrui 13 <br/> 2000 Antwerpen </address></a></h2><div class="price"><div class="amount"><span>€ 6.320</span></div></div><div class="features"><div class="features_item"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/clock.svg" role="presentation" src="/assets/@listings/features/clock.svg"></svg-icon><svg-icon class="value" data-src="/assets/@listings/icons/lock.svg" src="/assets/@listings/icons/lock.svg"></svg-icon></div><div aria-label="De woonoppervlakte is 523 vierkante meter" class="features_item" role="img"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/floorspace-surface.svg" role="presentation"></svg-icon><span aria-hidden="true" class="value">523m²</span></div><div class="features_energy"><svg-icon data-src="/assets/@listings/energy-labels/epc_x.svg"></svg-icon></div></div></div></article></zimmo-listing><zimmo-listing _ngcontent-ng-c1732943450="" _nghost-ng-c3516730="" class="" ngh="30" style="order: 40;" zimmointersectionobserver=""><article><div class="infobox_photo"><img alt="Bedrijfsvastgoed te koop in Raymonde de Larochelaan 50,
+ 9000 Gent" class="main-image" height="618" src="https://files.zimmo.be/backend-api/q4c6J2efEjQ-8HM34cAzWFv5JFg=/828x618/filters:image-format(pjpg)/-/real-estate/customers/b51c1823-4bae-11e9-922b-005056b768a1/dealers/b31369f3-62f9-4cca-96ef-b8652bdde916/listings/779606b7-3528-42b5-864c-f04017842d73/images/01a033c1-ab46-7ec5-9c14-340a64a1def6" width="828"/><div class="header"><div class="sticker"></div></div><div class="logo"><img alt="PANORAMA B2B Gent kantoren logo" src="https://files.zimmo.be/backend-api/x12STQmtgb4wwt-IHHtL9s3TDOw=/filters:image-format(pjpg)/-/real-estate/customers/b51c1823-4bae-11e9-922b-005056b768a1/logos/01995d00-92f6-7412-b6ea-6258f0d09b91" title="PANORAMA B2B Gent kantoren logo"/></div></div><div class="infobox_content"><h2><a href="/nl/gent-9000/te-koop/bedrijfsvastgoed/LR7M2"><span class="title">Bedrijfsvastgoed te koop<span class="zimmo-code">LR7M2</span></span><address> Raymonde de Larochelaan 50 <br/> 9000 Gent </address></a></h2><div class="price"><div class="amount"><span>€ 9.280.800</span></div></div><div class="features"><div class="features_item"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/clock.svg" role="presentation" src="/assets/@listings/features/clock.svg"></svg-icon><svg-icon class="value" data-src="/assets/@listings/icons/lock.svg" src="/assets/@listings/icons/lock.svg"></svg-icon></div><div aria-label="De woonoppervlakte is 2.578 vierkante meter" class="features_item" role="img"><svg-icon aria-hidden="true" data-src="/assets/@listings/features/floorspace-surface.svg" role="presentation"></svg-icon><span aria-hidden="true" class="value">2.578m²</span></div><div class="features_energy"><svg-icon data-src="/assets/@listings/energy-labels/epc_a_plus.svg"></svg-icon></div></div></div></article></zimmo-listing>
+'''
+
+
+def check_live_angular_tiles() -> bool:
+    """Values, not coverage (CLAUDE.md §10), on the markup the site serves
+    today. Before 2026-09-23 bedrooms, EPC and property_type were None on
+    every row of every run, KLQRM vanished from the output, LR7M2's area
+    read as 2.578 m2 and LRZ2M's commercial surface was written into
+    surface_m2 -- all while every run reported success."""
+    rows = {p.sku: p for p in parse_products(LIVE_ANGULAR_TILES_HTML, "https://www.zimmo.be/")}
+    expected = {
+        #        price     cur    listing property            beds  m2      epc
+        "LRZLA": (210000.0, "EUR", "sale", "huis",             3,    None,   "F"),
+        "LR7M2": (9280800.0, "EUR", "sale", "bedrijfsvastgoed", None, 2578.0, "A+"),
+        "KLQRM": (None,     None,  "rent", "bedrijfsvastgoed", None, 537.0,  None),
+        "LRZ2M": (16249.0,  "EUR", "rent", "bedrijfsvastgoed", None, None,   "B"),
+        "LRZK9": (550000.0, "EUR", "sale", "appartement",      2,    140.0,  "F"),
+        "KRBP7": (6320.0,   "EUR", "rent", "bedrijfsvastgoed", None, 523.0,  None),
+    }
+    ok = True
+    if set(rows) != set(expected):
+        print(f"[FAIL] live Angular tiles: expected skus {sorted(expected)}, got {sorted(rows)}")
+        ok = False
+    for sku, exp in expected.items():
+        r = rows.get(sku)
+        if r is None:
+            continue
+        got = (r.price, r.currency, r.listing_type, r.property_type, r.bedrooms, r.surface_m2, r.epc_label)
+        if got != exp:
+            print(f"[FAIL] live Angular tile {sku}: expected {exp}, got {got}")
+            ok = False
+    if "LRZK9" in rows and rows["LRZK9"].title != "Appartement à vendre":
+        print(f"[FAIL] live Angular tile LRZK9 title: {rows['LRZK9'].title!r}")
+        ok = False
+    if ok:
+        print("[PASS] six real 2026-09-23 tiles: price-on-request kept with no currency, "
+              "areas read Belgian-style, commercial surface not taken for living area, "
+              "bedrooms/EPC/EPB read from icons in NL and FR, property/listing type from the URL")
+    return ok
 
 
 def check_epc_label_natural_language_regression() -> bool:
@@ -1075,6 +1164,7 @@ if __name__ == "__main__":
     price_parser_ok = check_price_parser_audit_regressions()
     item_link_selector_ok = check_item_link_selector_rejects_nav_chrome()
     css_fallback_scope_ok = check_css_fallback_widened_scope_is_used()
+    live_tiles_ok = check_live_angular_tiles()
     epc_regression_ok = check_epc_label_natural_language_regression()
     unattempted_ok = check_unattempted_pages_prevent_false_complete()
     no_sku_dedup_ok = check_no_sku_rows_participate_in_dedup()
@@ -1083,7 +1173,7 @@ if __name__ == "__main__":
                   and engine_import_ok and ast_ok and flags_ok and signatures_ok
                   and docker_version_ok and pyproject_version_ok and price_parser_ok
                   and price_no_swallow_ok and pagination_param_ok
-                  and epc_regression_ok and css_fallback_scope_ok and item_link_selector_ok
+                  and epc_regression_ok and css_fallback_scope_ok and live_tiles_ok and item_link_selector_ok
                   and unattempted_ok and no_sku_dedup_ok
                   and exit_code == 0)
     sys.exit(0 if overall_ok else 1)

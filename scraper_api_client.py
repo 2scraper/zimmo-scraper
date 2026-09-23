@@ -121,7 +121,12 @@ def scrape_via_api(url: str, api_key: str, wait_for_text: str, timeout: int,
         "data_format": "raw",
         "format": "json",
         "timeout": timeout,
-        "waitFor": json.dumps({"text": wait_for_text}),
+        # An OBJECT. It was sent as a JSON-encoded string until
+        # 2026-09-23, when the live API answered every such request with
+        # HTTP 422 "ScrapeParser: params.waitFor must be an object" --
+        # still billing $0.0005 for it. The same page with an object:
+        # HTTP 200, 412 KB.
+        "waitFor": {"text": wait_for_text},
     }
     if cdp_url:
         payload["cdpurl"] = cdp_url
@@ -168,8 +173,11 @@ def scrape_via_api(url: str, api_key: str, wait_for_text: str, timeout: int,
         raise RuntimeError(f"Scraper API returned HTTP {resp.status_code}: {resp.text[:300]}")
 
     data = resp.json()
-    target_status = data.get("status")
-    if target_status and target_status >= 400:
+    # Measured 2026-09-23: `status` is the API's own verdict ("success"),
+    # and the TARGET's HTTP code is `http_code`. Comparing the string
+    # `status` with 400 raised TypeError on every successful call.
+    target_status = data.get("http_code")
+    if isinstance(target_status, int) and target_status >= 400:
         logger.warning("Target page itself responded with HTTP %s -- parsing whatever HTML "
                         "came back anyway.", target_status)
 

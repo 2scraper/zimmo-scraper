@@ -204,7 +204,80 @@ def _to_float(text: Optional[str]) -> Optional[float]:
     return float(m.group()) if m else None
 
 
+def _parse_belgian_number(text: Optional[str]) -> Optional[float]:
+    """A tile's area as the site writes it: `.` groups thousands and `,`
+    is the decimal point, as in its prices. Measured 2026-09-23: "De
+    woonoppervlakte is 2.578 vierkante meter" is 2,578 m², and
+    _to_float() read it as 2.578."""
+    if not text:
+        return None
+    m = re.search(r"\d[\d.]*(?:,\d+)?", text)
+    if not m:
+        return None
+    integer_part, _, decimal_part = m.group().partition(",")
+    integer_part = integer_part.replace(".", "")
+    if not integer_part.isdigit():
+        return None
+    value = float(integer_part)
+    if decimal_part.isdigit():
+        value += float(decimal_part) / (10 ** len(decimal_part))
+    return value
+
+
+# The listing-type segment of a result URL, in both languages the site
+# serves: /nl/{city}/te-koop/{type}/{code}, /fr/{city}/a-vendre/{type}/{code}.
+# Measured 2026-09-23 on gent-9000/te-koop, antwerpen-2000/te-huur and
+# bruxelles-1000/a-vendre. The URL is a contract; the title is display
+# text ("Project" carries no sale word at all, which is why a new-build
+# project read as listing_type None).
+_URL_TYPE_RE = re.compile(r"/(te-koop|te-huur|a-vendre|a-louer)/([a-z-]+)/[A-Za-z0-9]+/?$")
+_URL_LISTING_TYPES = {"te-koop": "sale", "a-vendre": "sale", "te-huur": "rent", "a-louer": "rent"}
+
+# The Angular tile (live since 2026-09-15) names every feature by its ICON,
+# and the icon file is the same in both languages while the aria-label is
+# translated ("Het aantal slaapkamers is 3" / "Le nombre de chambres est
+# de 3"). Counted 2026-09-23 over 104 tiles on four pages: bedrooms.svg,
+# floorspace-surface.svg, plot-surface.svg, commercial-surface.svg.
+# Only floor space is a living area, so only it becomes surface_m2 -- the
+# old free-text regex took whichever "N m²" came first, and wrote a shop's
+# commercial surface into it.
+# Energy icons come in two schemes: `epc_*` (Flanders, Wallonia) and
+# `epb_*` (Brussels' EPB/PEB certificate), both graded A-G, plus
+# `epc_x.svg` for a listing without a grade -- which stays None rather
+# than becoming a letter. Counted 2026-09-23: 57 epc_, 17 epb_, 1 epc_x.
+_EPC_ICON_RE = re.compile(r"energy-labels/ep[bc]_([a-g])((?:_plus)*)\.svg", re.IGNORECASE)
+
+
+def _tile_features(scope) -> Optional[dict]:
+    """Bedrooms, living area and EPC label from the tile's own feature
+    icons, or None when the scope has no feature block (the older markup
+    this parser also reads, where the regexes below still apply)."""
+    features = scope.select_one(".features")
+    if features is None:
+        return None
+    out = {"bedrooms": None, "surface_m2": None, "epc_label": None}
+    for item in features.select(".features_item"):
+        icon = item.select_one("svg-icon[data-src]")
+        name = icon["data-src"].rsplit("/", 1)[-1] if icon else ""
+        value_el = item.select_one(".value")
+        text = item.get("aria-label") or (value_el.get_text(" ", strip=True) if value_el else "")
+        if name == "bedrooms.svg":
+            n = _parse_belgian_number(text)
+            out["bedrooms"] = int(n) if n is not None else None
+        elif name == "floorspace-surface.svg":
+            out["surface_m2"] = _parse_belgian_number(text)
+    energy = features.select_one("svg-icon[data-src*='energy-labels/']")
+    if energy is not None:
+        m = _EPC_ICON_RE.search(energy["data-src"])
+        if m:
+            out["epc_label"] = m.group(1).upper() + "+" * (len(m.group(2)) // len("_plus"))
+    return out
+
+
 def _detect_listing_type(text: str, url: str) -> Optional[str]:
+    m = _URL_TYPE_RE.search(url)
+    if m:
+        return _URL_LISTING_TYPES[m.group(1)]
     lowered = (text + " " + url).lower()
     if any(w in lowered for w in _SALE_WORDS):
         return "sale"
@@ -361,6 +434,17 @@ def _parse_css_fallback(html: str, base_url: str, category: Optional[str]) -> Li
         text = a.get_text(" ", strip=True)
         has_price_here = _PRICE_NEAR_EUR_RE.search(text)
         scope = a
+        # The Angular grid wraps each listing in its own <zimmo-listing>
+        # element -- exactly one listing, so the scope question is
+        # answered by the markup rather than by walking up until a price
+        # appears. That walk cannot find a tile that HAS no price: measured
+        # 2026-09-23, "Prijs op aanvraag" (price on request) on a real
+        # listing made it vanish from the output without a word.
+        tile = a.find_parent("zimmo-listing")
+        if tile is not None:
+            base = urljoin(base_url, href.split("#")[0])
+            groups.setdefault(base, []).append((a, tile))
+            continue
         if not has_price_here:
             candidate = a.parent
             depth = 0
@@ -393,9 +477,15 @@ def _parse_css_fallback(html: str, base_url: str, category: Optional[str]) -> Li
             continue
         full_text = scope.get_text(" ", strip=True)
 
-        price_match = _PRICE_NEAR_EUR_RE.search(full_text)
+        is_tile = scope.name == "zimmo-listing"
+        price_el = scope.select_one(".price") if is_tile else None
+        price_text = price_el.get_text(" ", strip=True) if price_el is not None else full_text
+        price_match = _PRICE_NEAR_EUR_RE.search(price_text)
         price = _parse_price_near_eur(price_match) if price_match else None
-        if price is None:
+        # Outside a <zimmo-listing> the price is what proves a link is a
+        # listing at all; inside one the tile already proves it, and a
+        # missing price is the site saying "on request".
+        if price is None and not is_tile:
             continue
 
         texts = [a.get_text(" ", strip=True) for a in anchors]
@@ -432,6 +522,20 @@ def _parse_css_fallback(html: str, base_url: str, category: Optional[str]) -> Li
         epc_value_match = _EPC_VALUE_RE.search(full_text)
         surface_match = _SURFACE_RE.search(full_text)
         bedrooms_match = _BEDROOMS_RE.search(full_text)
+        epc_label = epc_label_match.group(1).upper() if epc_label_match else None
+        surface_m2 = _to_float(surface_match.group(1)) if surface_match else None
+        bedrooms = int(bedrooms_match.group(1)) if bedrooms_match else None
+
+        # The current tile states these by icon; where it has a feature
+        # block, that is the only source, so a missing living area stays
+        # None instead of borrowing a plot or commercial "N m²".
+        features = _tile_features(scope)
+        if features is not None:
+            epc_label = features["epc_label"]
+            surface_m2 = features["surface_m2"]
+            bedrooms = features["bedrooms"]
+
+        type_match = _URL_TYPE_RE.search(url)
 
         products.append(Product(
             url=url,
@@ -439,13 +543,17 @@ def _parse_css_fallback(html: str, base_url: str, category: Optional[str]) -> Li
             title=title,
             location=location,
             price=price,
+            # The € beside the number is the evidence for EUR; a
+            # price-on-request tile has neither, so claim neither.
+            currency="EUR" if price is not None else None,
             image_url=_find_image_near(anchors),
             category=category,
             listing_type=_detect_listing_type(full_text, url),
-            epc_label=epc_label_match.group(1).upper() if epc_label_match else None,
+            property_type=type_match.group(2) if type_match else None,
+            epc_label=epc_label,
             epc_value=_to_float(epc_value_match.group(1)) if epc_value_match else None,
-            surface_m2=_to_float(surface_match.group(1)) if surface_match else None,
-            bedrooms=int(bedrooms_match.group(1)) if bedrooms_match else None,
+            surface_m2=surface_m2,
+            bedrooms=bedrooms,
         ))
     return products
 

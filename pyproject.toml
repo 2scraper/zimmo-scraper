@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zimmo-scraper"
-version = "1.0.0"
-description = "Zimmo.be real-estate listing-page scraper (Playwright, Selenium, Puppeteer, or a cloud browser via CDP) — embedded-JSON parsing, Cloudflare Turnstile / reCAPTCHA v3 solving, proxies, fingerprints"
+version = "1.1.0"
+description = "Zimmo.be real-estate listing scraper (Playwright, Selenium, Puppeteer, or the 2Captcha Scraping Browser API via CDP) — sale and rent listings, prices, living area, bedrooms, EPC labels, proxies, captcha solving"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -21,7 +21,7 @@ dependencies = [
 # by CI; check both whenever either changes).
 playwright = ["playwright>=1.44"]
 puppeteer = ["pyppeteer>=2.0"]
-selenium = ["selenium>=4.20", "webdriver-manager>=4.0"]
+selenium = ["selenium>=4.20"]
 
 [tool.setuptools]
 # This is a flat collection of top-level scripts, not a package —

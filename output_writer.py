@@ -64,6 +64,11 @@ EXIT_BAD_USAGE = 2
 EXIT_BLOCKED = 3
 EXIT_ZERO_PRODUCTS = 4
 EXIT_REMOTE_API_ERROR = 5
+# The same code, under the name the rest of this family uses for it as of
+# 2026-09-21: 5 means "the content was never obtained" -- a remote API
+# error is one way for that to happen, a dead proxy or a load timeout is
+# another. See CLAUDE.md §25.
+EXIT_FETCH_FAILED = EXIT_REMOTE_API_ERROR
 EXIT_PARTIAL = 6
 
 
@@ -149,6 +154,19 @@ def finish_run(
               "were recovered -- writing nothing, leaving any previous good output "
               "in place.")
         return EXIT_BLOCKED
+
+    # Pages were attempted and NONE completed: the content was never
+    # obtained -- a dead proxy, a load timeout -- which is a different fact
+    # from "we read the listing and it held nothing". Without this it fell
+    # through to EXIT_ZERO_PRODUCTS and told a pipeline the catalogue was
+    # empty on a run that never reached the site. Exit 5 has meant "the
+    # content was never obtained" family-wide since 2026-09-21 (CLAUDE.md
+    # §25); this repo predates that pass.
+    if not products and failed_pages and pages_completed == 0:
+        print(f"[!] None of the {len(failed_pages)} attempted page(s) could be fetched -- "
+              f"the content was never obtained. Writing nothing, leaving any previous "
+              f"good output in place.")
+        return EXIT_FETCH_FAILED
 
     if not products and not allow_empty:
         print(f"[!] Zero products found across {pages_completed}/{pages_requested} "
