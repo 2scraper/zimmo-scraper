@@ -7,7 +7,7 @@ manage. A patch release means "fixes" — not that every flag is frozen,
 so a behaviour-changing default landing in a patch is stated plainly
 here rather than treated as a violation of the format.
 
-## [Unreleased]
+## [1.1.1] — pyppeteer proxy auth, .gitignore by shape (2026-09-29)
 
 ### Fixed
 
