@@ -7,6 +7,23 @@ manage. A patch release means "fixes" — not that every flag is frozen,
 so a behaviour-changing default landing in a patch is stated plainly
 here rather than treated as a violation of the format.
 
+## [Unreleased]
+
+### Fixed
+
+Found by a family-wide probe over a fresh clone of every repo in the
+organisation on 2026-09-29.
+
+- **The pyppeteer engine could not authenticate a proxy on current Chrome.**
+  `page.authenticate()` uses `Network.setRequestInterception`, which current
+  Chrome no longer has ("wasn't found", exit 5 before the first request —
+  measured 2026-09-29 in rosreestr-scraper). Proxy 407s are now answered
+  through the CDP Fetch domain; `tests/test_family_sync.py` pins that the
+  old call stays gone.
+- **`.gitignore` let a renamed `.env` through** (`.env.bak`, `.env.local`),
+  and any run directory other than `live_results/`, and paged dumps
+  (`X.page3`). Now ignored by shape, with a test per shape.
+
 ## [1.1.0] — Measured against today's site (2026-09-23)
 
 > **Output changes for existing users.** Listings whose price reads

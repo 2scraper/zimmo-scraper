@@ -8,8 +8,20 @@ zimmo_listings.*
 *_debug.html
 *_debug.png
 
-# Local diagnostics / live-test working directory
+# Local diagnostics / live-test working directory — and ANY run directory by
+# kind, not one chosen name (a sibling committed a raw dump through `live/`),
+# plus paged dumps like X.page3 (family template §24, §26).
 live_results/
+live/
+out/
+output/
+runs/
+results/
+tmp/
+scratch/
+dumps/
+captures/
+*.page[0-9]*
 
 # Ad-hoc, one-off diagnostic/analysis scripts written DURING a live-
 # testing session (confirmed real gap: none of these were excluded
@@ -51,6 +63,11 @@ env/
 
 # Secrets and logs — NEVER commit these
 *.log
-.env
 *.key
 secrets*
+
+# Every spelling of a working .env, not just `.env`: a `.env.bak` or
+# `.env.local` is exactly how a live key gets one `git add -A` from a commit
+# (family template §22). The negation keeps the documented example tracked.
+.env*
+!.env.example
