@@ -54,6 +54,31 @@ ITEM_LINK_SELECTOR = SELECTORS["item_link"]
 MIN_CARD_MATCHES = 5
 
 
+
+async def _authenticate_proxy(page, username, password):
+    """Answer the proxy's 407 through the CDP Fetch domain.
+
+    Not page.authenticate(): pyppeteer implements it with
+    Network.setRequestInterception, which current Chrome no longer has —
+    measured 2026-09-29 in a sibling repo against Chrome for Testing:
+    "Protocol error (Network.setRequestInterception): ... wasn't found",
+    exit 5 before the first request.
+    """
+    cdp = await page.target.createCDPSession()
+
+    def paused(event):
+        asyncio.ensure_future(cdp.send("Fetch.continueRequest", {"requestId": event["requestId"]}))
+
+    def auth(event):
+        asyncio.ensure_future(cdp.send("Fetch.continueWithAuth", {
+            "requestId": event["requestId"],
+            "authChallengeResponse": {"response": "ProvideCredentials",
+                                      "username": username, "password": password}}))
+
+    cdp.on("Fetch.requestPaused", paused)
+    cdp.on("Fetch.authRequired", auth)
+    await cdp.send("Fetch.enable", {"handleAuthRequests": True, "patterns": [{"urlPattern": "*"}]})
+
 def _mask_credentials(url: str) -> str:
     if "@" not in url:
         return url
@@ -193,7 +218,7 @@ async def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyP
                     # Credentials never reach argv (CLAUDE.md §8): only
                     # the credential-free server string goes on the
                     # launch flag. The credential itself goes through
-                    # page.authenticate() below instead.
+                    # the DevTools Fetch domain below (_authenticate_proxy).
                     launch_args["args"].append(f"--proxy-server={current_exit.server_only()}")
                     logger.info("Using proxy exit: %s", current_exit.masked())
                 browser = await launch(**launch_args)
@@ -201,7 +226,7 @@ async def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyP
                 page = pages[0] if pages else await browser.newPage()
                 if current_exit and current_exit.auth_tuple():
                     username, password = current_exit.auth_tuple()
-                    await page.authenticate({"username": username, "password": password})
+                    await _authenticate_proxy(page, username, password)
 
             logger.info("Loading %s (page %d, attempt %d/%d)",
                         url, page_num, attempt + 1, args.retries + 1)
