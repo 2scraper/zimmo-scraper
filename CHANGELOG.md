@@ -9,6 +9,10 @@ here rather than treated as a violation of the format.
 
 ## [1.1.1] — pyppeteer proxy auth, .gitignore by shape (2026-09-29)
 
+> **Behaviour change for an existing user:** with the pyppeteer engine, an
+> authenticated `--proxy` now works on current Chrome; before this release it
+> stopped with exit 5 before the first request.
+
 ### Fixed
 
 Found by a family-wide probe over a fresh clone of every repo in the
