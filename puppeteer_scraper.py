@@ -39,7 +39,11 @@ from captcha_solver import (
     INJECT_TOKEN_JS, INJECT_TURNSTILE_TOKEN_JS,
 )
 from product_parser import parse_products, SELECTORS
-from output_writer import Product, finish_run, dedupe_by_sku, EXIT_CRASH
+from output_writer import (
+    Product, finish_run, dedupe_by_sku, EXIT_CRASH,
+    classify_page, page_outcome_is_ok, should_retry_page, status_rules_out_listings,
+    PAGE_CONTENT, PAGE_BLOCKED,
+)
 from env_config import apply_env_defaults
 from proxy_pool import (
     ProxyPool, load_proxy_file, is_proxy_error,
@@ -52,6 +56,22 @@ logger = logging.getLogger("puppeteer_scraper")
 
 ITEM_LINK_SELECTOR = SELECTORS["item_link"]
 MIN_CARD_MATCHES = 5
+
+# FIXED (2026-10-07, found on a live run while verifying an external
+# audit): pyppeteer gives connect() and the calls after it no timeout of
+# their own, and opens its websocket with pings disabled, so a remote
+# browser that stops answering left the run hanging -- measured: page 1
+# done, then the connect for page 2 still waiting after ten minutes.
+# Every remote call is bounded (CLAUDE.md §8); a timeout lands in the
+# ordinary retry path below.
+CDP_CALL_TIMEOUT_S = 60
+
+
+async def _bounded(awaitable, seconds: float, what: str):
+    try:
+        return await asyncio.wait_for(awaitable, seconds)
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"{what} did not answer within {seconds:.0f}s") from None
 
 
 
@@ -196,12 +216,17 @@ async def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyP
             if args.cdp_endpoint:
                 logger.info("Connecting to existing browser over CDP: %s",
                             _mask_credentials(args.cdp_endpoint))
-                browser = await connect(browserWSEndpoint=args.cdp_endpoint)
-                pages = await browser.pages()
-                page = pages[0] if pages else await browser.newPage()
+                browser = await _bounded(connect(browserWSEndpoint=args.cdp_endpoint),
+                                         CDP_CALL_TIMEOUT_S, "CDP connect")
+                pages = await _bounded(browser.pages(), CDP_CALL_TIMEOUT_S, "CDP browser.pages()")
+                page = pages[0] if pages else await _bounded(browser.newPage(), CDP_CALL_TIMEOUT_S,
+                                                             "CDP newPage()")
                 try:
-                    cdp_session = await page.target.createCDPSession()
-                    await cdp_session.send("Captcha.setAutoSolve", {"autoSolve": True, "options": [{"type": "*"}]})
+                    cdp_session = await _bounded(page.target.createCDPSession(), CDP_CALL_TIMEOUT_S,
+                                                 "CDP createCDPSession()")
+                    await _bounded(cdp_session.send("Captcha.setAutoSolve",
+                                                    {"autoSolve": True, "options": [{"type": "*"}]}),
+                                   CDP_CALL_TIMEOUT_S, "Captcha.setAutoSolve")
                     cdp_session.on("Captcha.detected", lambda *_: logger.info("[Browser API] CAPTCHA detected."))
                     cdp_session.on("Captcha.solveFinished", lambda *_: logger.info("[Browser API] CAPTCHA solved."))
                     cdp_session.on("Captcha.solveFailed", lambda *_: logger.warning("[Browser API] CAPTCHA auto-solve failed."))
@@ -230,10 +255,12 @@ async def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyP
 
             logger.info("Loading %s (page %d, attempt %d/%d)",
                         url, page_num, attempt + 1, args.retries + 1)
-            await page.goto(url, {"waitUntil": "domcontentloaded", "timeout": 60000})
+            response = await page.goto(url, {"waitUntil": "domcontentloaded", "timeout": 60000})
+            http_status = response.status if response else None
 
             detected = await handle_captcha_if_present(page, args)
-            rendered_ok = await _wait_for_listing_markers(page)
+            rendered_ok = (False if status_rules_out_listings(http_status)
+                           else await _wait_for_listing_markers(page))
 
             html = await page.content()
             products = parse_products(html, page.url, category=args.category)
@@ -260,17 +287,26 @@ async def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyP
                                 page_num, debug_html)
 
             if args.cdp_endpoint:
-                await page.close()
+                await _bounded(page.close(), CDP_CALL_TIMEOUT_S, "CDP page.close()")
                 await browser.disconnect()
             else:
                 await browser.close()
 
-            page_blocked = detected and not products and not rendered_ok
+            # FIXED (external audit, 2026-10-07, P1/P2): see
+            # output_writer.classify_page() -- shared by all three engines.
+            outcome = classify_page(len(products), http_status, detected, rendered_ok)
+            if outcome != PAGE_CONTENT:
+                logger.warning("Page %d: HTTP %s, classified as %s.",
+                                page_num, http_status, outcome)
+            if should_retry_page(outcome, http_status) and attempt < args.retries:
+                await asyncio.sleep(args.retry_delay)
+                continue
+            ok = page_outcome_is_ok(outcome)
 
-            if args.delay > 0:
+            if ok and args.delay > 0:
                 await asyncio.sleep(args.delay)
 
-            return products, True, page_blocked, False
+            return products, ok, outcome == PAGE_BLOCKED, False
 
         except Exception as e:
             error_msg = redact_secret_patterns(str(e))
@@ -380,6 +416,7 @@ async def scrape_async(args) -> int:
     any_remote_error = remote_1
     pages_completed = 1 if ok_1 else 0
     unattempted_pages: List[int] = []
+    exhausted_pages: List[int] = []
 
     remaining_pages = list(range(2, args.pages + 1))
     if remaining_pages and not products_1 and not ok_1:
@@ -400,7 +437,9 @@ async def scrape_async(args) -> int:
         any_blocked = any_blocked or more_blocked
         any_remote_error = any_remote_error or more_remote
         pages_completed += len(more_results) - len(more_failed)
-        unattempted_pages.extend(more_unattempted)
+        # Pages left undispatched because a page added no new sku: the
+        # listing ENDED, which is a complete answer, not a gap in one.
+        exhausted_pages = more_unattempted
 
     all_products = [p for page_num in sorted(page_results) for p in page_results[page_num]]
     all_products = dedupe_by_sku(all_products)
@@ -411,6 +450,7 @@ async def scrape_async(args) -> int:
         failed_pages=failed_pages, unattempted_pages=unattempted_pages, blocked=any_blocked,
         remote_api_error=any_remote_error, allow_empty=args.allow_empty,
         started_at=started_at,
+        exhausted_pages=exhausted_pages, url=args.url,
     )
 
 

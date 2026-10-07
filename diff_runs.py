@@ -10,6 +10,11 @@ Refuses to compare two runs unless BOTH sidecars report status
 products that were delisted between runs, which is a false signal about
 the SITE rather than a true one about the scrape.
 
+Also refuses two runs of DIFFERENT searches (the sidecar's `selection`),
+and reports a listing missing from a newer run that read only a window of
+the listing (--pages ended before the listing did) as `left_selection`
+rather than `removed`.
+
 Usage:
     python3 diff_runs.py --old run1.json --new run2.json
     python3 diff_runs.py --old run1.json --new run2.json --fail-on-change
@@ -68,12 +73,21 @@ _COMPARE_FIELDS = (
 )
 
 
-def diff(old_products: List[dict], new_products: List[dict]) -> dict:
+def diff(old_products: List[dict], new_products: List[dict],
+         new_saw_whole_listing: bool = True) -> dict:
+    """`new_saw_whole_listing` is False when the newer run read only a
+    window of the listing (--pages stopped it before the listing ended).
+    A listing missing from such a run may simply have moved past the
+    window -- a new listing pushed it to page 4 -- so it is reported as
+    `left_selection`, not `removed`: we do not know it left the site.
+    (External audit, 2026-10-07, P2.)"""
     old_by_key = _index_by_products(old_products)
     new_by_key = _index_by_products(new_products)
 
     added = [new_by_key[key] for key in new_by_key if key not in old_by_key]
-    removed = [old_by_key[key] for key in old_by_key if key not in new_by_key]
+    missing = [old_by_key[key] for key in old_by_key if key not in new_by_key]
+    removed = missing if new_saw_whole_listing else []
+    left_selection = [] if new_saw_whole_listing else missing
 
     changed = []
     source_changed = []
@@ -105,6 +119,7 @@ def diff(old_products: List[dict], new_products: List[dict]) -> dict:
     return {
         "added_count": len(added), "added": added,
         "removed_count": len(removed), "removed": removed,
+        "left_selection_count": len(left_selection), "left_selection": left_selection,
         "changed_count": len(changed), "changed": changed,
         "source_changed_count": len(source_changed), "source_changed": source_changed,
     }
@@ -116,6 +131,10 @@ def main() -> int:
     p.add_argument("--new", required=True, help="Path to the later run's .json output")
     p.add_argument("--fail-on-change", action="store_true",
                    help="Exit non-zero if anything actually changed (source_changed-only rows are ignored)")
+    p.add_argument("--allow-selection-mismatch", action="store_true",
+                   help="Diff two runs even though their sidecars record different searches "
+                        "(different URL or filters). The result then describes the two "
+                        "searches, not changes on the site.")
     args = p.parse_args()
 
     old_meta, new_meta = _load_meta(args.old), _load_meta(args.new)
@@ -131,12 +150,35 @@ def main() -> int:
                   f"products delisted between runs, which is false.")
             return 2
 
+    # FIXED (external audit, 2026-10-07, P2): two `complete` runs of
+    # DIFFERENT searches -- Gent and Antwerpen -- were diffed without a
+    # word, and every listing read as added or removed. The sidecar now
+    # records the search (output_writer.selection_url); sidecars written
+    # before 1.2.0 have none, which is warned about rather than refused,
+    # so an existing pipeline keeps working across the upgrade.
+    old_sel = (old_meta.get("selection") or {}).get("url")
+    new_sel = (new_meta.get("selection") or {}).get("url")
+    if old_sel and new_sel and old_sel != new_sel and not args.allow_selection_mismatch:
+        print(f"[!] The two runs cover different searches -- refusing to diff:\n"
+              f"      old: {old_sel}\n      new: {new_sel}\n"
+              f"    Pass --allow-selection-mismatch to diff them anyway.")
+        return 2
+    if not (old_sel and new_sel):
+        print("[!] A sidecar predates zimmo-scraper 1.2.0 and records no search URL -- "
+              "cannot confirm both runs cover the same search.")
+
+    # A sidecar without `listing_exhausted` (pre-1.2.0) could not finish
+    # `complete` on an exhausted listing at all, so it read a window.
+    new_saw_whole_listing = bool(new_meta.get("listing_exhausted"))
+
     old_products = _load_products(args.old)
     new_products = _load_products(args.new)
-    result = diff(old_products, new_products)
+    result = diff(old_products, new_products, new_saw_whole_listing)
 
     print(f"Added:           {result['added_count']}")
     print(f"Removed:         {result['removed_count']}")
+    print(f"Left selection:  {result['left_selection_count']} (no longer within the newer "
+          f"run's --pages window; not proof of removal, ignored by --fail-on-change)")
     print(f"Changed:         {result['changed_count']}")
     print(f"Source-changed:  {result['source_changed_count']} (provenance differs, "
           f"ignored by --fail-on-change)")
@@ -147,6 +189,9 @@ def main() -> int:
     for item in result["removed"][:10]:
         identifier = item.get("sku") or item.get("url")
         print(f"  - {identifier}: {item.get('title')}")
+    for item in result["left_selection"][:10]:
+        identifier = item.get("sku") or item.get("url")
+        print(f"  ? {identifier}: {item.get('title')}")
     for item in result["changed"][:10]:
         print(f"  ~ {item['key']}: {list(item['changes'].keys())}")
 

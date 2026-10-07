@@ -20,12 +20,23 @@ Usage:
     python3 check_no_credentials.py --path DIR # scans a specific tree
 
 Exit 0: nothing found. Exit 1: a possible credential was found (printed
-with file:line).
+as file:line and the KIND of match -- never the matched text).
+
+FIXED (2026-10-07, found while verifying an external audit): this used
+to walk the whole directory, `.env` deliberately included, and print
+every match verbatim. A git-ignored `.env` holding real keys -- the place
+the README tells users to put them -- was therefore reported as a
+"committed credential" and its values were written to the terminal by
+every local `python3 smoke_test.py`. Inside a git work tree the scan now
+covers exactly what git could commit (tracked files plus untracked files
+that are not ignored), so a force-added `.env` is still caught and an
+ignored one is never opened; and a finding is reported without its text.
 """
 
 import argparse
 import os
 import re
+import subprocess
 import sys
 from typing import List, Tuple
 
@@ -80,7 +91,33 @@ _SCAN_EXTENSIONS = (".py", ".md", ".yml", ".yaml", ".toml", ".txt", ".env.exampl
 _SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv"}
 
 
+def _is_candidate(filename: str) -> bool:
+    return filename.endswith(_SCAN_EXTENSIONS) or filename in (".env.example", ".env")
+
+
+def _git_committable_files(root: str):
+    """Files git could commit under `root` -- tracked, plus untracked and
+    not ignored -- or None when `root` is not inside a git work tree."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, check=True, timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return [os.path.join(root, rel) for rel in out.decode("utf-8", "replace").split("\0") if rel]
+
+
 def _iter_files(root: str):
+    committable = _git_committable_files(root)
+    if committable is not None:
+        for path in committable:
+            if _is_candidate(os.path.basename(path)) and os.path.isfile(path):
+                yield path
+        return
+    # Not a git checkout (an unpacked sdist, a copied tree): nothing here
+    # can be committed, and a real `.env` is the user's own configuration,
+    # so it is never opened.
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
         for filename in filenames:
@@ -91,7 +128,7 @@ def _iter_files(root: str):
             # `git add -f`) was invisible to this scanner entirely,
             # confirmed live during audit. `.env` is now checked
             # exactly like every other tracked file.
-            if filename.endswith(_SCAN_EXTENSIONS) or filename in (".env.example", ".env"):
+            if _is_candidate(filename) and filename != ".env":
                 yield os.path.join(dirpath, filename)
 
 
@@ -99,8 +136,18 @@ def _is_allowlisted(path: str) -> bool:
     return any(marker in path for marker in _ALLOWLISTED_SUBSTRINGS)
 
 
+def describe_match(matched_text: str) -> str:
+    """What was matched, without the secret: the kind of credential and
+    its length. A scanner that prints what it found is itself a leak."""
+    if "://" in matched_text:
+        scheme = matched_text.split("://", 1)[0]
+        return f"credential URL ({scheme}://***:***@)"
+    return f"{len(matched_text)}-char hex key"
+
+
 def scan(root: str) -> List[Tuple[str, int, str]]:
-    """Returns a list of (path, line_number, matched_text) findings."""
+    """Returns a list of (path, line_number, description) findings. The
+    description never contains the matched text (see describe_match)."""
     findings = []
     this_file = os.path.abspath(__file__)
 
@@ -117,13 +164,13 @@ def scan(root: str) -> List[Tuple[str, int, str]]:
 
         for line_num, line in enumerate(lines, start=1):
             for match in _HEX_KEY_RE.finditer(line):
-                findings.append((path, line_num, match.group()))
+                findings.append((path, line_num, describe_match(match.group())))
             for match in _CREDENTIAL_URL_RE.finditer(line):
                 if _MASKED_MARKER in line:
                     continue
                 if not _looks_like_real_credential(match.group()):
                     continue
-                findings.append((path, line_num, match.group()))
+                findings.append((path, line_num, describe_match(match.group())))
 
     return findings
 
