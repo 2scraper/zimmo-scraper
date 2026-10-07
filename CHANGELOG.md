@@ -7,6 +7,31 @@ manage. A patch release means "fixes" — not that every flag is frozen,
 so a behaviour-changing default landing in a patch is stated plainly
 here rather than treated as a violation of the format.
 
+## [1.2.1] — one CDP connection per run (2026-10-07)
+
+### Fixed
+
+- **`--cdp-endpoint` reconnected for every page, and the Scraping Browser
+  refused the reconnects.** The API allows one live connection per
+  profile; a connect made a moment after the previous page let go was
+  answered with HTTP 500 on the websocket upgrade. Measured on a 3-page
+  run of v1.2.0: Playwright opened five connections and retried twice;
+  pyppeteer opened four and spent a 60 s connect timeout. Both engines
+  now hold one connection for the run and open each page in a fresh tab;
+  a failed attempt drops the connection so its retry starts clean. The
+  same runs after the fix: one connection, no errors, 39 s and 31 s.
+  The log's last line reports how many connections a run opened.
+- With `--cdp-endpoint`, the Playwright engine fetches pages 2+ in the
+  main thread instead of a one-worker pool: a Playwright sync object
+  belongs to the thread that created it, and `--concurrency` above 1 is
+  refused over CDP anyway. Pagination, exhaustion and failure bookkeeping
+  are the same code as the pool's.
+
+### Not changed
+
+- The Selenium engine: it cannot authenticate to a Scraping Browser
+  endpoint at all (README, Engines), so it never met this.
+
 ## [1.2.0] — honest page verdicts, diffable runs, a scanner that keeps secrets (2026-10-07)
 
 > **Behaviour changes for an existing user:**

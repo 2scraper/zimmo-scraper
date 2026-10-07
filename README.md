@@ -135,6 +135,14 @@ Reuse the same `pid` across runs rather than minting a new one each time
 persistent `pid` keeps its cookies (and therefore its trust with
 Cloudflare) between runs.
 
+A run holds ONE connection for all its pages, each page in a fresh tab
+(Playwright and pyppeteer engines). Reconnecting per page, as versions
+before 1.2.1 did, was refused with HTTP 500 roughly every other page —
+measured 2026-10-07: five connections and two refusals for a 3-page run
+before, one connection and none after. The log's last line says how many
+connections the run opened; more than one means an attempt failed and
+was retried on a fresh connection.
+
 Without a browser at all, via the Scraper API (one page per call, key
 from `TWOCAPTCHA_KEY` in `.env`):
 
