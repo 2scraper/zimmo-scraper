@@ -859,7 +859,7 @@ def check_no_committed_credentials() -> bool:
     if findings:
         print(f"[FAIL] {len(findings)} possible committed credential(s) found:")
         for path, line_num, text in findings:
-            print(f"  {path}:{line_num}: {text}")
+            print(f"  {path}:{line_num}: {text}")  # a description, never the secret
         return False
     print("[PASS] no committed credentials found (check_no_credentials.py)")
     return True
@@ -1148,7 +1148,198 @@ def check_shared_call_signatures() -> bool:
     return ok
 
 
+# --- External audit 2026-10-07: what a page IS, and what a run then says ---
+
+def check_classify_page_contract() -> bool:
+    """P1/P2: a 403 used to count as a completed page and a 500 as an
+    empty one. The statuses are the ones measured live on 2026-10-07
+    (output_writer.py's comment above classify_page)."""
+    from output_writer import (classify_page, page_outcome_is_ok, should_retry_page,
+                               PAGE_CONTENT, PAGE_EMPTY, PAGE_BLOCKED,
+                               PAGE_NOT_FOUND, PAGE_FETCH_ERROR)
+    # (products, status, challenge, rendered) -> outcome, ok, retry
+    cases = [
+        ((21, 200, False, True), PAGE_CONTENT, True, False),
+        ((21, 403, True, True), PAGE_CONTENT, True, False),     # challenge cleared after a 403
+        ((0, 200, False, False), PAGE_EMPTY, True, False),
+        ((0, 403, True, False), PAGE_BLOCKED, False, False),    # Cloudflare "Even geduld..."
+        ((0, 403, False, False), PAGE_BLOCKED, False, False),   # a bare 403, no marker
+        ((0, 200, True, False), PAGE_BLOCKED, False, False),    # marker only, status 200
+        ((0, None, True, False), PAGE_BLOCKED, False, False),   # status unknown
+        ((0, 404, False, False), PAGE_NOT_FOUND, False, False),
+        ((0, 500, False, False), PAGE_FETCH_ERROR, False, True),
+        ((0, 429, False, False), PAGE_FETCH_ERROR, False, True),
+        ((0, 400, False, False), PAGE_FETCH_ERROR, False, False),
+    ]
+    ok = True
+    for args_, want, want_ok, want_retry in cases:
+        got = classify_page(*args_)
+        if (got, page_outcome_is_ok(got), should_retry_page(got, args_[1])) != (want, want_ok, want_retry):
+            print(f"[FAIL] classify_page{args_} -> {got} (ok={page_outcome_is_ok(got)}, "
+                  f"retry={should_retry_page(got, args_[1])}); expected {want}, ok={want_ok}, "
+                  f"retry={want_retry}")
+            ok = False
+    if ok:
+        print(f"[PASS] classify_page: {len(cases)} outcomes, incl. 403/404/429/500 and a cleared challenge")
+    return ok
+
+
+def check_engines_use_shared_page_classification() -> bool:
+    """All three engines must take their page verdict from classify_page()
+    -- the audit's P1 was the same `return products, True, ...` in all
+    three, so a fix to one engine only would leave its twins reporting
+    exit 0 on the same page."""
+    ok = True
+    for name in ("playwright_scraper.py", "puppeteer_scraper.py", "selenium_scraper.py"):
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), name)).read()
+        tree = ast.parse(src)
+        fetch = next(n for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_fetch_page")
+        calls = {n.func.id for n in ast.walk(fetch)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        missing = {"classify_page", "page_outcome_is_ok", "should_retry_page"} - calls
+        literal_success = [n.lineno for n in ast.walk(fetch)
+                           if isinstance(n, ast.Return) and isinstance(n.value, ast.Tuple)
+                           and len(n.value.elts) == 4 and isinstance(n.value.elts[1], ast.Constant)
+                           and n.value.elts[1].value is True]
+        if missing or literal_success:
+            print(f"[FAIL] {name}: _fetch_page does not call {sorted(missing)} "
+                  f"or returns a literal success at line(s) {literal_success}")
+            ok = False
+    if ok:
+        print("[PASS] all three engines classify pages through output_writer.classify_page()")
+    return ok
+
+
+def check_exhausted_listing_is_complete() -> bool:
+    """A listing that ENDED before --pages did is a complete answer. It
+    used to finish partial/exit 6, which also made diff_runs refuse it."""
+    import tempfile
+    from output_writer import Product, finish_run, EXIT_OK
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix = os.path.join(tmp, "run")
+        code = finish_run([Product(sku="A", url="u1")], prefix, "json",
+                          pages_requested=4, pages_completed=2, exhausted_pages=[3, 4],
+                          url="https://www.zimmo.be/nl/gent-9000/te-koop/?page=2")
+        meta = json.load(open(prefix + ".meta.json"))
+    want = ("complete", True, "https://www.zimmo.be/nl/gent-9000/te-koop")
+    got = (meta["status"], meta["listing_exhausted"], meta["selection"]["url"])
+    if code != EXIT_OK or got != want:
+        print(f"[FAIL] exhausted listing -> exit {code}, {got}; expected exit 0, {want}")
+        return False
+    print("[PASS] an exhausted listing is complete, exit 0, and records its selection")
+    return True
+
+
+def check_selection_url_normalisation() -> bool:
+    from output_writer import selection_url
+    same = [
+        "https://www.zimmo.be/nl/gent-9000/te-koop/",
+        "HTTPS://WWW.ZIMMO.BE/nl/gent-9000/te-koop",
+        "https://www.zimmo.be/nl/gent-9000/te-koop/?page=3",
+    ]
+    filtered_a = selection_url("https://www.zimmo.be/nl/gent-9000/te-koop/?b=2&a=1&page=2")
+    filtered_b = selection_url("https://www.zimmo.be/nl/gent-9000/te-koop?a=1&b=2")
+    if len({selection_url(u) for u in same}) != 1 or filtered_a != filtered_b \
+            or selection_url(same[0]) == selection_url("https://www.zimmo.be/nl/antwerpen-2000/te-koop/"):
+        print("[FAIL] selection_url does not identify the same search consistently")
+        return False
+    print("[PASS] selection_url: page param, case, slash and query order ignored; city kept")
+    return True
+
+
+def _run_diff(tmp, old_meta, new_meta, old_rows, new_rows, *extra):
+    import subprocess
+    for name, meta, rows in (("old", old_meta, old_rows), ("new", new_meta, new_rows)):
+        json.dump(rows, open(os.path.join(tmp, f"{name}.json"), "w"))
+        json.dump(meta, open(os.path.join(tmp, f"{name}.meta.json"), "w"))
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diff_runs.py")
+    r = subprocess.run([sys.executable, script, "--old", os.path.join(tmp, "old.json"),
+                        "--new", os.path.join(tmp, "new.json"), *extra],
+                       capture_output=True, text=True)
+    return r.returncode, r.stdout
+
+
+def check_diff_refuses_different_selection_and_marks_window() -> bool:
+    """P2: Gent vs Antwerpen was diffed as market movement; and a listing
+    pushed past --pages read as removed from the site."""
+    import tempfile
+    gent = {"status": "complete", "listing_exhausted": False,
+            "selection": {"url": "https://www.zimmo.be/nl/gent-9000/te-koop", "pages_requested": 1}}
+    antw = dict(gent, selection={"url": "https://www.zimmo.be/nl/antwerpen-2000/te-koop",
+                                 "pages_requested": 1})
+    a, b = {"sku": "A", "url": "u/A", "title": "a"}, {"sku": "B", "url": "u/B", "title": "b"}
+    ok = True
+    with tempfile.TemporaryDirectory() as tmp:
+        code, _ = _run_diff(tmp, gent, antw, [a], [b])
+        if code != 2:
+            print(f"[FAIL] diff of two different searches exited {code}, expected 2 (refused)")
+            ok = False
+        code, out = _run_diff(tmp, gent, gent, [a], [b], "--fail-on-change")
+        if "Left selection:  1" not in out or "Removed:         0" not in out or code != 1:
+            print(f"[FAIL] window run: expected 1 left_selection, 0 removed, exit 1 (one added); "
+                  f"got exit {code}:\n{out}")
+            ok = False
+        code, out = _run_diff(tmp, gent, gent, [a, b], [b], "--fail-on-change")
+        if code != 0:
+            print(f"[FAIL] a listing that only left the --pages window failed --fail-on-change "
+                  f"(exit {code})")
+            ok = False
+        whole = dict(gent, listing_exhausted=True)
+        code, out = _run_diff(tmp, whole, whole, [a, b], [b], "--fail-on-change")
+        if "Removed:         1" not in out or code != 1:
+            print(f"[FAIL] a run that read the WHOLE listing must report removal; got exit {code}:\n{out}")
+            ok = False
+    if ok:
+        print("[PASS] diff_runs refuses different searches and separates left_selection from removed")
+    return ok
+
+
+def check_credential_scan_never_opens_ignored_env_or_prints_secrets() -> bool:
+    """2026-10-07: the scanner walked into the user's git-ignored .env and
+    printed its keys verbatim on every local smoke run. The fake key below
+    is built at runtime so this file does not itself contain one."""
+    import subprocess
+    import tempfile
+    from check_no_credentials import scan
+    fake_key = "".join("0123456789abcdef"[(i * 7) % 16] for i in range(32))
+    fake_url = "http://" + "zz9user" + ":" + "Qx7pw0rd" + "@proxy.invalid:1"
+    ok = True
+    with tempfile.TemporaryDirectory() as tmp:
+        git = ["git", "-C", tmp, "-c", "user.email=t@t", "-c", "user.name=t"]
+        try:
+            subprocess.run(git + ["init", "-q"], check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError):
+            print("[SKIP] git not available -- credential-scan scope not checked")
+            return True
+        open(os.path.join(tmp, ".gitignore"), "w").write(".env\n")
+        open(os.path.join(tmp, ".env"), "w").write(f"TWOCAPTCHA_KEY={fake_key}\nZIMMO_PROXY={fake_url}\n")
+        if scan(tmp):
+            print("[FAIL] the scanner reported a git-IGNORED .env as committed")
+            ok = False
+        subprocess.run(git + ["add", "-f", ".env"], check=True, capture_output=True)
+        findings = scan(tmp)
+        if len(findings) != 2:
+            print(f"[FAIL] a force-added .env must be caught (2 findings), got {len(findings)}")
+            ok = False
+        if any(fake_key in str(f) or "Qx7pw0rd" in str(f) for f in findings):
+            print("[FAIL] the scanner's findings contain the secret text itself")
+            ok = False
+    if ok:
+        print("[PASS] credential scan: ignored .env never opened, force-added .env caught, "
+              "no secret text in findings")
+    return ok
+
+
 if __name__ == "__main__":
+    classify_ok = check_classify_page_contract()
+    engines_classify_ok = check_engines_use_shared_page_classification()
+    exhausted_ok = check_exhausted_listing_is_complete()
+    selection_ok = check_selection_url_normalisation()
+    diff_selection_ok = check_diff_refuses_different_selection_and_marks_window()
+    credential_scope_ok = check_credential_scan_never_opens_ignored_env_or_prints_secrets()
+    audit_2026_10_07_ok = (classify_ok and engines_classify_ok and exhausted_ok and selection_ok
+                           and diff_selection_ok and credential_scope_ok)
     wording_ok = check_banned_wording()
     env_ok = check_env_example_matches_env_keys()
     env_roundtrip_ok = check_env_example_round_trips_as_unset()
@@ -1174,6 +1365,6 @@ if __name__ == "__main__":
                   and docker_version_ok and pyproject_version_ok and price_parser_ok
                   and price_no_swallow_ok and pagination_param_ok
                   and epc_regression_ok and css_fallback_scope_ok and live_tiles_ok and item_link_selector_ok
-                  and unattempted_ok and no_sku_dedup_ok
+                  and unattempted_ok and no_sku_dedup_ok and audit_2026_10_07_ok
                   and exit_code == 0)
     sys.exit(0 if overall_ok else 1)

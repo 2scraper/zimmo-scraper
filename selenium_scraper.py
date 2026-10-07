@@ -51,7 +51,11 @@ from captcha_solver import (
     INJECT_TOKEN_JS, INJECT_TURNSTILE_TOKEN_JS,
 )
 from product_parser import parse_products, SELECTORS
-from output_writer import Product, finish_run, dedupe_by_sku, EXIT_CRASH
+from output_writer import (
+    Product, finish_run, dedupe_by_sku, EXIT_CRASH,
+    classify_page, page_outcome_is_ok, should_retry_page, status_rules_out_listings,
+    PAGE_CONTENT, PAGE_BLOCKED,
+)
 from env_config import apply_env_defaults
 from proxy_pool import (
     ProxyPool, load_proxy_file, is_proxy_error,
@@ -205,6 +209,21 @@ def _wait_for_listing_markers(driver, timeout_s: int = 45) -> bool:
         return False
 
 
+def _navigation_status(driver) -> Optional[int]:
+    """WebDriver has no API for the HTTP status of a navigation, so read
+    it from the page's own Navigation Timing entry (`responseStatus`,
+    Chrome 109+). Measured live 2026-10-07 to agree with Playwright's
+    response.status on 200, 403 and 404 pages. 0 or an older browser
+    reads as None -- unknown, which classify_page() handles."""
+    try:
+        status = driver.execute_script(
+            "var e = performance.getEntriesByType('navigation')[0];"
+            "return e ? e.responseStatus : null;")
+    except Exception:
+        return None
+    return status if isinstance(status, int) and status > 0 else None
+
+
 def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                  worker_offset: int) -> Tuple[List[Product], bool, bool, bool]:
     current_exit = proxy_pool.get_exit_for_worker(worker_offset) if proxy_pool else None
@@ -244,8 +263,10 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                     continue
                 return [], False, False, False
 
+            http_status = _navigation_status(driver)
             detected = handle_captcha_if_present(driver, args)
-            rendered_ok = _wait_for_listing_markers(driver)
+            rendered_ok = (False if status_rules_out_listings(http_status)
+                           else _wait_for_listing_markers(driver))
 
             html = driver.page_source
             products = parse_products(html, driver.current_url, category=args.category)
@@ -276,12 +297,21 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
             else:
                 driver.quit()
 
-            page_blocked = detected and not products and not rendered_ok
+            # FIXED (external audit, 2026-10-07, P1/P2): see
+            # output_writer.classify_page() -- shared by all three engines.
+            outcome = classify_page(len(products), http_status, detected, rendered_ok)
+            if outcome != PAGE_CONTENT:
+                logger.warning("Page %d: HTTP %s, classified as %s.",
+                                page_num, http_status, outcome)
+            if should_retry_page(outcome, http_status) and attempt < args.retries:
+                time.sleep(args.retry_delay)
+                continue
+            ok = page_outcome_is_ok(outcome)
 
-            if args.delay > 0:
+            if ok and args.delay > 0:
                 time.sleep(args.delay)
 
-            return products, True, page_blocked, False
+            return products, ok, outcome == PAGE_BLOCKED, False
 
         except Exception as e:
             error_msg = redact_secret_patterns(str(e))
@@ -391,6 +421,7 @@ def scrape(args) -> int:
     any_remote_error = remote_1
     pages_completed = 1 if ok_1 else 0
     unattempted_pages: List[int] = []
+    exhausted_pages: List[int] = []
 
     remaining_pages = list(range(2, args.pages + 1))
     if remaining_pages and not products_1 and not ok_1:
@@ -411,7 +442,9 @@ def scrape(args) -> int:
         any_blocked = any_blocked or more_blocked
         any_remote_error = any_remote_error or more_remote
         pages_completed += len(more_results) - len(more_failed)
-        unattempted_pages.extend(more_unattempted)
+        # Pages left undispatched because a page added no new sku: the
+        # listing ENDED, which is a complete answer, not a gap in one.
+        exhausted_pages = more_unattempted
 
     all_products = [p for page_num in sorted(page_results) for p in page_results[page_num]]
     all_products = dedupe_by_sku(all_products)
@@ -422,6 +455,7 @@ def scrape(args) -> int:
         failed_pages=failed_pages, unattempted_pages=unattempted_pages, blocked=any_blocked,
         remote_api_error=any_remote_error, allow_empty=args.allow_empty,
         started_at=started_at,
+        exhausted_pages=exhausted_pages, url=args.url,
     )
 
 

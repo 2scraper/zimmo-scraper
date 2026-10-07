@@ -6,11 +6,10 @@ zimmo-scraper — Playwright edition (primary engine)
 Scrapes zimmo.be real-estate search-results pages -- houses, apartments,
 for sale or for rent, any Belgian city/postcode/category page.
 
-Confirmed live (2026-08-22): zimmo.be search-results pages embed their
-listings as a JSON array inline in a <script> tag -- see
-product_parser.py's module docstring for the full story, including
-which of its three extraction paths are confirmed live versus
-best-effort fallbacks.
+Since 2026-09-15 zimmo.be renders its listing grid with Angular, and the
+tiles themselves are what gets parsed (the inline JSON array confirmed on
+2026-08-22 is gone) -- see product_parser.py's module docstring for which
+of its three extraction paths fires on the live site today.
 
 Pagination: **CORRECTED via a real live run, 2026-09-16** -- an earlier
 `discover_search_params`-style probe (from an unrelated MCP-tooling
@@ -58,7 +57,11 @@ from captcha_solver import (
     INJECT_TOKEN_JS, INJECT_TURNSTILE_TOKEN_JS,
 )
 from product_parser import parse_products, SELECTORS
-from output_writer import Product, finish_run, dedupe_by_sku, EXIT_CRASH
+from output_writer import (
+    Product, finish_run, dedupe_by_sku, EXIT_CRASH,
+    classify_page, page_outcome_is_ok, should_retry_page, status_rules_out_listings,
+    PAGE_CONTENT, PAGE_BLOCKED,
+)
 from env_config import apply_env_defaults
 from proxy_pool import (
     ProxyPool, load_proxy_file, is_proxy_error,
@@ -260,10 +263,12 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
 
                 logger.info("Loading %s (page %d, attempt %d/%d)",
                             url, page_num, attempt + 1, args.retries + 1)
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                http_status = response.status if response else None
 
                 detected = handle_captcha_if_present(page, args)
-                rendered_ok = _wait_for_listing_markers(page)
+                rendered_ok = (False if status_rules_out_listings(http_status)
+                               else _wait_for_listing_markers(page))
 
                 html = page.content()
                 products = parse_products(html, page.url, category=args.category)
@@ -294,16 +299,27 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                 else:
                     browser.close()
 
-                page_blocked = detected and not products and not rendered_ok
+                # FIXED (external audit, 2026-10-07, P1/P2): this used to
+                # return success for ANY page that loaded, so a 403 on
+                # page 2 read as a complete run and a 500 as an empty
+                # catalogue. classify_page() is shared by all engines.
+                outcome = classify_page(len(products), http_status, detected, rendered_ok)
+                if outcome != PAGE_CONTENT:
+                    logger.warning("Page %d: HTTP %s, classified as %s.",
+                                    page_num, http_status, outcome)
+                if should_retry_page(outcome, http_status) and attempt < args.retries:
+                    time.sleep(args.retry_delay)
+                    continue
+                ok = page_outcome_is_ok(outcome)
 
                 # --delay: wired up (audit finding #3 -- previously
                 # "reserved" but never actually slept). Only after a
                 # SUCCESSFUL fetch, not before the first attempt and not
                 # between retries (--retry-delay already covers that).
-                if args.delay > 0:
+                if ok and args.delay > 0:
                     time.sleep(args.delay)
 
-                return products, True, page_blocked, False
+                return products, ok, outcome == PAGE_BLOCKED, False
 
         except PWTimeout:
             logger.error("Timeout loading %s (attempt %d/%d).", url, attempt + 1, args.retries + 1)
@@ -415,6 +431,7 @@ def scrape(args) -> int:
     any_remote_error = remote_1
     pages_completed = 1 if ok_1 else 0
     unattempted_pages: List[int] = []
+    exhausted_pages: List[int] = []
 
     remaining_pages = list(range(2, args.pages + 1))
     if remaining_pages and not products_1 and not ok_1:
@@ -437,7 +454,9 @@ def scrape(args) -> int:
         any_blocked = any_blocked or more_blocked
         any_remote_error = any_remote_error or more_remote
         pages_completed += len(more_results) - len(more_failed)
-        unattempted_pages.extend(more_unattempted)
+        # Pages left undispatched because a page added no new sku: the
+        # listing ENDED, which is a complete answer, not a gap in one.
+        exhausted_pages = more_unattempted
 
     # Merge in PAGE ORDER, not arrival order.
     all_products = [p for page_num in sorted(page_results) for p in page_results[page_num]]
@@ -457,6 +476,7 @@ def scrape(args) -> int:
         blocked=any_blocked,
         remote_api_error=any_remote_error, allow_empty=args.allow_empty,
         started_at=started_at,
+        exhausted_pages=exhausted_pages, url=args.url,
     )
 
 

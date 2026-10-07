@@ -208,18 +208,38 @@ Two confirmed engine-specific limits:
 
 Each run writes `<out>.json` / `<out>.csv` (per `--format`) plus
 `<out>.meta.json`, a sidecar recording `status` (`complete` / `partial`
-/ `empty`), `stop_reason`, which pages failed by number, and the product
-count. **A run that finds zero products writes nothing at all by
-default** — pass `--allow-empty` to force writing (an empty CSV still
-carries its header row either way).
+/ `empty`), `stop_reason`, which pages failed by number, the product
+count, the search it covered (`selection`: the URL without its `page`
+parameter) and whether it read the listing to its end
+(`listing_exhausted`, with the pages that made unnecessary in
+`exhausted_pages`). **A run that finds zero products writes nothing at
+all by default** — pass `--allow-empty` to force writing (an empty CSV
+still carries its header row either way).
+
+How each page is judged, measured on zimmo.be 2026-10-07: a served search
+page is HTTP 200; Cloudflare's "Even geduld..." challenge is HTTP 403 and
+counts as **blocked** unless listings appear after it; a route the site
+does not serve is HTTP 404 ("Pagina niet gevonden"); 429 and 5xx are
+retried up to `--retries` times and then count as failed. A page number
+past the end of a listing is HTTP 200 carrying page 1 again — the run
+recognises that by its data (no new listing) and stops there,
+`complete`. A failed or blocked page lands in `failed_pages`; if it is
+page 1, no later page is requested.
 
 Exit codes, identical across all engines: `0` ok · `1` crash ·
 `2` bad usage · `3` blocked · `4` zero products (no `--allow-empty`) ·
 `5` the content was never obtained (a remote API error, a dead proxy, a
-load timeout — no page could be fetched) · `6` partial (some pages failed).
+load timeout, an HTTP error or 404 on page 1) · `6` partial (some pages
+failed or were blocked).
 
 Compare two runs: `python3 diff_runs.py --old run1.json --new run2.json`
-— refuses to compare a run whose sidecar isn't `status: complete`.
+— refuses to compare a run whose sidecar isn't `status: complete`, and
+two runs of different searches (`--allow-selection-mismatch` overrides
+that). When the newer run read only a window of the listing (`--pages`
+ended before the listing did), a listing missing from it is reported as
+**left selection**, not removed: a new listing may simply have pushed it
+to the next page. Only a run that read the listing to its end can report
+a removal.
 
 ## Testing
 
