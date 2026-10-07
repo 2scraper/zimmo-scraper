@@ -206,34 +206,79 @@ async def _wait_for_listing_markers(page, timeout_ms: int = 45000) -> bool:
     return False
 
 
+class CdpConnection:
+    """ONE connection to --cdp-endpoint for the whole run; each page gets
+    a fresh tab in it. Mirrors playwright_scraper.CdpConnection, whose
+    docstring has the measurement: reconnecting per page made the
+    Scraping Browser answer HTTP 500 on the next page's websocket upgrade.
+    All pages run on one event loop, so sharing it needs no thread rule.
+    A failed attempt drops it (reset()), and the retry reconnects."""
+
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+        self._browser = None
+        self.connects = 0
+
+    async def browser(self):
+        if self._browser is None:
+            logger.info("Connecting to existing browser over CDP: %s (one connection for the run)",
+                        _mask_credentials(self.endpoint))
+            self._browser = await _bounded(connect(browserWSEndpoint=self.endpoint),
+                                           CDP_CALL_TIMEOUT_S, "CDP connect")
+            self.connects += 1
+        return self._browser
+
+    async def new_page(self):
+        browser = await self.browser()
+        page = await _bounded(browser.newPage(), CDP_CALL_TIMEOUT_S, "CDP newPage()")
+        try:
+            cdp_session = await _bounded(page.target.createCDPSession(), CDP_CALL_TIMEOUT_S,
+                                         "CDP createCDPSession()")
+            await _bounded(cdp_session.send("Captcha.setAutoSolve",
+                                            {"autoSolve": True, "options": [{"type": "*"}]}),
+                           CDP_CALL_TIMEOUT_S, "Captcha.setAutoSolve")
+            cdp_session.on("Captcha.detected", lambda *_: logger.info("[Browser API] CAPTCHA detected."))
+            cdp_session.on("Captcha.solveFinished", lambda *_: logger.info("[Browser API] CAPTCHA solved."))
+            cdp_session.on("Captcha.solveFailed", lambda *_: logger.warning("[Browser API] CAPTCHA auto-solve failed."))
+            logger.info("2captcha Browser API Captcha.setAutoSolve enabled.")
+        except Exception as e:
+            logger.info("Captcha.setAutoSolve not available on this --cdp-endpoint (%s).",
+                        redact_secret_patterns(str(e)))
+        return page
+
+    async def reset(self):
+        browser, self._browser = self._browser, None
+        if browser is not None:
+            try:
+                await _bounded(browser.disconnect(), CDP_CALL_TIMEOUT_S, "CDP disconnect")
+            except Exception:
+                pass
+
+
 async def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
-                       worker_offset: int) -> Tuple[List[Product], bool, bool, bool]:
+                       worker_offset: int, cdp: Optional[CdpConnection] = None
+                       ) -> Tuple[List[Product], bool, bool, bool]:
+    """With --cdp-endpoint the page opens in `cdp`, the run's one
+    connection; a caller that passes none gets one for this call only."""
+    own_cdp = None
+    if args.cdp_endpoint and cdp is None:
+        cdp = own_cdp = CdpConnection(args.cdp_endpoint)
+    try:
+        return await _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, cdp)
+    finally:
+        if own_cdp is not None:
+            await own_cdp.reset()
+
+
+async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, cdp):
     current_exit = proxy_pool.get_exit_for_worker(worker_offset) if proxy_pool else None
 
     for attempt in range(args.retries + 1):
         browser = None
+        page = None
         try:
-            if args.cdp_endpoint:
-                logger.info("Connecting to existing browser over CDP: %s",
-                            _mask_credentials(args.cdp_endpoint))
-                browser = await _bounded(connect(browserWSEndpoint=args.cdp_endpoint),
-                                         CDP_CALL_TIMEOUT_S, "CDP connect")
-                pages = await _bounded(browser.pages(), CDP_CALL_TIMEOUT_S, "CDP browser.pages()")
-                page = pages[0] if pages else await _bounded(browser.newPage(), CDP_CALL_TIMEOUT_S,
-                                                             "CDP newPage()")
-                try:
-                    cdp_session = await _bounded(page.target.createCDPSession(), CDP_CALL_TIMEOUT_S,
-                                                 "CDP createCDPSession()")
-                    await _bounded(cdp_session.send("Captcha.setAutoSolve",
-                                                    {"autoSolve": True, "options": [{"type": "*"}]}),
-                                   CDP_CALL_TIMEOUT_S, "Captcha.setAutoSolve")
-                    cdp_session.on("Captcha.detected", lambda *_: logger.info("[Browser API] CAPTCHA detected."))
-                    cdp_session.on("Captcha.solveFinished", lambda *_: logger.info("[Browser API] CAPTCHA solved."))
-                    cdp_session.on("Captcha.solveFailed", lambda *_: logger.warning("[Browser API] CAPTCHA auto-solve failed."))
-                    logger.info("2captcha Browser API Captcha.setAutoSolve enabled.")
-                except Exception as e:
-                    logger.info("Captcha.setAutoSolve not available on this --cdp-endpoint (%s).",
-                                redact_secret_patterns(str(e)))
+            if cdp:
+                page = await cdp.new_page()
             else:
                 launch_args = {
                     "headless": args.headless,
@@ -286,9 +331,8 @@ async def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyP
                 logger.warning("0 listings parsed on page %d -- saved %s for diagnosis.",
                                 page_num, debug_html)
 
-            if args.cdp_endpoint:
+            if cdp:
                 await _bounded(page.close(), CDP_CALL_TIMEOUT_S, "CDP page.close()")
-                await browser.disconnect()
             else:
                 await browser.close()
 
@@ -310,12 +354,18 @@ async def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyP
 
         except Exception as e:
             error_msg = redact_secret_patterns(str(e))
-            if browser:
+            if cdp:
+                # A failed attempt closes its tab and drops the connection,
+                # so the retry starts from a fresh one.
+                if page is not None:
+                    try:
+                        await _bounded(page.close(), CDP_CALL_TIMEOUT_S, "CDP page.close()")
+                    except Exception:
+                        pass
+                await cdp.reset()
+            elif browser:
                 try:
-                    if args.cdp_endpoint:
-                        await browser.disconnect()
-                    else:
-                        await browser.close()
+                    await browser.close()
                 except Exception:
                     pass
             if is_proxy_error(error_msg) and proxy_pool:
@@ -395,6 +445,16 @@ async def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concur
 
 
 async def scrape_async(args) -> int:
+    cdp = CdpConnection(args.cdp_endpoint) if args.cdp_endpoint else None
+    try:
+        return await _scrape_async(args, cdp)
+    finally:
+        if cdp is not None:
+            logger.info("CDP connections opened this run: %d.", cdp.connects)
+            await cdp.reset()
+
+
+async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
     started_at = datetime.now(timezone.utc).isoformat()
 
     proxy_pool = None
@@ -408,7 +468,8 @@ async def scrape_async(args) -> int:
     refuse_concurrency_with_cdp_endpoint(args.concurrency, args.cdp_endpoint)
 
     url_1 = page_url(args.url, 1)
-    products_1, ok_1, blocked_1, remote_1 = await _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0)
+    products_1, ok_1, blocked_1, remote_1 = await _fetch_page(url_1, 1, args, proxy_pool,
+                                                              worker_offset=0, cdp=cdp)
 
     page_results = {1: products_1}
     failed_pages = [] if ok_1 else [1]
@@ -427,7 +488,7 @@ async def scrape_async(args) -> int:
     if remaining_pages:
         async def fetch_fn(page_num, worker_offset):
             url = page_url(args.url, page_num)
-            return await _fetch_page(url, page_num, args, proxy_pool, worker_offset)
+            return await _fetch_page(url, page_num, args, proxy_pool, worker_offset, cdp=cdp)
 
         initial_skus = {p.sku for p in products_1 if p.sku}
         more_results, more_failed, more_blocked, more_remote, more_unattempted = \

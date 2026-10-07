@@ -1193,8 +1193,11 @@ def check_engines_use_shared_page_classification() -> bool:
     for name in ("playwright_scraper.py", "puppeteer_scraper.py", "selenium_scraper.py"):
         src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), name)).read()
         tree = ast.parse(src)
-        fetch = next(n for n in ast.walk(tree)
-                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_fetch_page")
+        # The attempt loop lives in _fetch_page_attempts where an engine
+        # splits it out (the CDP-connection wrapper), else in _fetch_page.
+        funcs = {n.name: n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        fetch = funcs.get("_fetch_page_attempts") or funcs["_fetch_page"]
         calls = {n.func.id for n in ast.walk(fetch)
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
         missing = {"classify_page", "page_outcome_is_ok", "should_retry_page"} - calls

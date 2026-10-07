@@ -40,6 +40,7 @@ Requires: pip install playwright beautifulsoup4 requests --break-system-packages
 """
 
 import argparse
+import contextlib
 import logging
 import sys
 import threading
@@ -201,8 +202,78 @@ def _wait_for_listing_markers(page, timeout_ms: int = 45000) -> bool:
     return False
 
 
+class CdpConnection:
+    """ONE connection to --cdp-endpoint for the whole run.
+
+    FIXED (2026-10-07, found on live runs while verifying an external
+    audit): every page used to open its own connection and drop it
+    again. The Scraping Browser API allows one live connection per
+    profile, and a reconnect made a moment after the previous page let
+    go was answered with HTTP 500 on the websocket upgrade -- measured on
+    pages 2 and 3 of a 3-page run, each costing a retry. Each page now
+    gets a fresh TAB in the one connected browser instead.
+
+    Playwright's sync objects belong to the thread that created them, so
+    a CdpConnection is only ever used from the main thread: scrape()
+    fetches every page in that thread when --cdp-endpoint is set, which
+    costs nothing, because --concurrency above 1 is refused there anyway.
+
+    A failed attempt drops the connection (reset()), so the retry starts
+    from a clean one instead of inheriting whatever broke."""
+
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+        self._pw = None
+        self._browser = None
+        self.connects = 0
+
+    def browser(self):
+        if self._browser is not None and self._browser.is_connected():
+            return self._browser
+        self.reset()
+        logger.info("Connecting to existing browser over CDP: %s (one connection for the run)",
+                    _mask_credentials(self.endpoint))
+        self._pw = sync_playwright().start()
+        try:
+            self._browser = self._pw.chromium.connect_over_cdp(self.endpoint)
+        except Exception:
+            self.reset()
+            raise
+        self.connects += 1
+        return self._browser
+
+    def new_page(self):
+        browser = self.browser()
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.new_page()
+        try:
+            cdp_session = context.new_cdp_session(page)
+            cdp_session.send("Captcha.setAutoSolve", {"autoSolve": True, "options": [{"type": "*"}]})
+            cdp_session.on("Captcha.detected", lambda *_: logger.info("[Browser API] CAPTCHA detected."))
+            cdp_session.on("Captcha.waitForSolve", lambda *_: logger.info("[Browser API] CAPTCHA sent to 2captcha."))
+            cdp_session.on("Captcha.solveFinished", lambda *_: logger.info("[Browser API] CAPTCHA solved."))
+            cdp_session.on("Captcha.solveFailed", lambda *_: logger.warning("[Browser API] CAPTCHA auto-solve failed."))
+            logger.info("2captcha Browser API Captcha.setAutoSolve enabled.")
+        except Exception as e:
+            logger.info("Captcha.setAutoSolve not available on this --cdp-endpoint (%s).",
+                        redact_secret_patterns(str(e)))
+        return page
+
+    def reset(self):
+        """Disconnect. Stopping the driver drops the websocket and leaves the
+        remote browser running, exactly as the per-page version did."""
+        self._browser = None
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
+
+
 def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
-                 worker_offset: int) -> Tuple[List[Product], bool, bool, bool]:
+                 worker_offset: int, cdp: Optional[CdpConnection] = None
+                 ) -> Tuple[List[Product], bool, bool, bool]:
     """Fetch and parse one page. Returns
     (products, success, blocked, remote_api_error).
 
@@ -223,30 +294,33 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
     works correctly at any concurrency; sharing one across threads does
     not, at any concurrency including 1.
 
-    A worker owns ONE exit for its lifetime."""
-    current_exit = proxy_pool.get_exit_for_worker(worker_offset) if proxy_pool else None
+    A worker owns ONE exit for its lifetime.
 
+    With --cdp-endpoint the page opens in `cdp`, the run's one connection
+    (see CdpConnection); a caller that passes none gets a connection that
+    lasts for this call only."""
+    current_exit = proxy_pool.get_exit_for_worker(worker_offset) if proxy_pool else None
+    own_cdp = None
+    if args.cdp_endpoint and cdp is None:
+        cdp = own_cdp = CdpConnection(args.cdp_endpoint)
+    try:
+        return _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset,
+                                    current_exit, cdp)
+    finally:
+        if own_cdp is not None:
+            own_cdp.reset()
+
+
+def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, current_exit, cdp):
     for attempt in range(args.retries + 1):
         browser = None
+        page = None
         try:
-            with sync_playwright() as pw:
-                if args.cdp_endpoint:
-                    logger.info("Connecting to existing browser over CDP: %s",
-                                _mask_credentials(args.cdp_endpoint))
-                    browser = pw.chromium.connect_over_cdp(args.cdp_endpoint)
-                    context = browser.contexts[0] if browser.contexts else browser.new_context()
-                    page = context.new_page()
-                    try:
-                        cdp_session = context.new_cdp_session(page)
-                        cdp_session.send("Captcha.setAutoSolve", {"autoSolve": True, "options": [{"type": "*"}]})
-                        cdp_session.on("Captcha.detected", lambda *_: logger.info("[Browser API] CAPTCHA detected."))
-                        cdp_session.on("Captcha.waitForSolve", lambda *_: logger.info("[Browser API] CAPTCHA sent to 2captcha."))
-                        cdp_session.on("Captcha.solveFinished", lambda *_: logger.info("[Browser API] CAPTCHA solved."))
-                        cdp_session.on("Captcha.solveFailed", lambda *_: logger.warning("[Browser API] CAPTCHA auto-solve failed."))
-                        logger.info("2captcha Browser API Captcha.setAutoSolve enabled.")
-                    except Exception as e:
-                        logger.info("Captcha.setAutoSolve not available on this --cdp-endpoint (%s).",
-                                    redact_secret_patterns(str(e)))
+            # Over CDP the driver is already running inside `cdp`; a second
+            # sync_playwright() in the same thread is refused by Playwright.
+            with (contextlib.nullcontext() if cdp else sync_playwright()) as pw:
+                if cdp:
+                    page = cdp.new_page()
                 else:
                     launch_kwargs = {"headless": args.headless}
                     if current_exit:
@@ -294,7 +368,7 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                     logger.warning("0 listings parsed on page %d -- saved %s for diagnosis.",
                                     page_num, debug_html)
 
-                if args.cdp_endpoint:
+                if cdp:
                     page.close()
                 else:
                     browser.close()
@@ -322,6 +396,7 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                 return products, ok, outcome == PAGE_BLOCKED, False
 
         except PWTimeout:
+            _drop_cdp_after_failure(cdp, page)
             logger.error("Timeout loading %s (attempt %d/%d).", url, attempt + 1, args.retries + 1)
             if attempt < args.retries:
                 time.sleep(args.retry_delay)
@@ -329,6 +404,7 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
             return [], False, False, False
 
         except Exception as e:
+            _drop_cdp_after_failure(cdp, page)
             error_msg = redact_secret_patterns(str(e))
             if is_proxy_error(error_msg) and proxy_pool:
                 logger.warning("Proxy error on exit %s (%s) -- rotating to a different exit.",
@@ -351,8 +427,25 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
     return [], False, False, False
 
 
+def _drop_cdp_after_failure(cdp: Optional[CdpConnection], page) -> None:
+    """A failed attempt over CDP closes its tab and drops the connection,
+    so the retry starts from a fresh one."""
+    if cdp is None:
+        return
+    if page is not None:
+        try:
+            page.close()
+        except Exception:
+            pass
+    cdp.reset()
+
+
 def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency: int,
-                               seen_skus_initial=()) -> Tuple[dict, List[int], bool, bool, List[int]]:
+                               seen_skus_initial=(), inline: bool = False
+                               ) -> Tuple[dict, List[int], bool, bool, List[int]]:
+    """`inline=True` fetches the pages one after another in THIS thread,
+    with the same bookkeeping -- for --cdp-endpoint, whose one connection
+    belongs to the main thread (see CdpConnection)."""
     page_results: dict = {}
     failed_pages: List[int] = []
     unattempted_pages: List[int] = []
@@ -361,6 +454,38 @@ def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency:
     seen_skus = set(seen_skus_initial)
     stop_event = threading.Event()
     workers = max(concurrency, 1)
+
+    def record(page_num, result):
+        nonlocal any_blocked, any_remote_error, seen_skus
+        products, ok, blocked, remote_err = result
+        page_results[page_num] = products
+        any_blocked = any_blocked or blocked
+        any_remote_error = any_remote_error or remote_err
+        if ok:
+            new_skus = {p.sku for p in products if p.sku} - seen_skus
+            seen_skus |= new_skus
+            if products and not new_skus:
+                logger.info("Page %d added no new sku -- listing appears exhausted, "
+                            "not requesting any later page.", page_num)
+                stop_event.set()
+        else:
+            failed_pages.append(page_num)
+
+    def call(page_num, result_fn):
+        try:
+            return result_fn()
+        except Exception as e:
+            logger.error("Worker raised while fetching page %d: %s",
+                         page_num, redact_secret_patterns(str(e)))
+            return [], False, False, False
+
+    if inline:
+        for idx, page_num in enumerate(remaining_pages):
+            if stop_event.is_set():
+                unattempted_pages.extend(remaining_pages[idx:])
+                break
+            record(page_num, call(page_num, lambda: fetch_fn(page_num, 0)))
+        return page_results, failed_pages, any_blocked, any_remote_error, sorted(unattempted_pages)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         pending = {}
@@ -383,30 +508,25 @@ def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency:
             done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
             for fut in done:
                 page_num = pending.pop(fut)
-                try:
-                    products, ok, blocked, remote_err = fut.result()
-                except Exception as e:
-                    logger.error("Worker raised while fetching page %d: %s",
-                                 page_num, redact_secret_patterns(str(e)))
-                    products, ok, blocked, remote_err = [], False, False, False
-                page_results[page_num] = products
-                any_blocked = any_blocked or blocked
-                any_remote_error = any_remote_error or remote_err
-                if ok:
-                    new_skus = {p.sku for p in products if p.sku} - seen_skus
-                    seen_skus |= new_skus
-                    if products and not new_skus:
-                        logger.info("Page %d added no new sku -- listing appears exhausted, "
-                                    "not requesting any later page.", page_num)
-                        stop_event.set()
-                else:
-                    failed_pages.append(page_num)
+                record(page_num, call(page_num, fut.result))
             try_submit()
 
     return page_results, failed_pages, any_blocked, any_remote_error, sorted(unattempted_pages)
 
 
 def scrape(args) -> int:
+    # One connection for the whole run over --cdp-endpoint (CdpConnection),
+    # released however the run ends.
+    cdp = CdpConnection(args.cdp_endpoint) if args.cdp_endpoint else None
+    try:
+        return _scrape(args, cdp)
+    finally:
+        if cdp is not None:
+            logger.info("CDP connections opened this run: %d.", cdp.connects)
+            cdp.reset()
+
+
+def _scrape(args, cdp: Optional[CdpConnection]) -> int:
     started_at = datetime.now(timezone.utc).isoformat()
 
     proxy_pool = None
@@ -423,7 +543,8 @@ def scrape(args) -> int:
     # -- see _fetch_page's own docstring for why every call, including
     # this one in the main thread, manages its own context uniformly).
     url_1 = page_url(args.url, 1)
-    products_1, ok_1, blocked_1, remote_1 = _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0)
+    products_1, ok_1, blocked_1, remote_1 = _fetch_page(url_1, 1, args, proxy_pool,
+                                                        worker_offset=0, cdp=cdp)
 
     page_results = {1: products_1}
     failed_pages = [] if ok_1 else [1]
@@ -444,11 +565,12 @@ def scrape(args) -> int:
     if remaining_pages:
         def fetch_fn(page_num, worker_offset):
             url = page_url(args.url, page_num)
-            return _fetch_page(url, page_num, args, proxy_pool, worker_offset)
+            return _fetch_page(url, page_num, args, proxy_pool, worker_offset, cdp=cdp)
 
         initial_skus = {p.sku for p in products_1 if p.sku}
         more_results, more_failed, more_blocked, more_remote, more_unattempted = \
-            _fetch_pages_concurrently(fetch_fn, remaining_pages, args.concurrency, initial_skus)
+            _fetch_pages_concurrently(fetch_fn, remaining_pages, args.concurrency, initial_skus,
+                                      inline=cdp is not None)
         page_results.update(more_results)
         failed_pages.extend(more_failed)
         any_blocked = any_blocked or more_blocked

@@ -67,11 +67,11 @@ def _run(engine, plan, pages, out, monkeypatch, url=URL):
     fetched = []
 
     if is_async:
-        async def fake(u, page_num, args, pool, worker_offset):
+        async def fake(u, page_num, args, pool, worker_offset, cdp=None):
             fetched.append(page_num)
             return plan[page_num]
     else:
-        def fake(u, page_num, args, pool, worker_offset):
+        def fake(u, page_num, args, pool, worker_offset, cdp=None):
             fetched.append(page_num)
             return plan[page_num]
     monkeypatch.setattr(mod, "_fetch_page", fake)
