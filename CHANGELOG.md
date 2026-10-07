@@ -7,6 +7,80 @@ manage. A patch release means "fixes" — not that every flag is frozen,
 so a behaviour-changing default landing in a patch is stated plainly
 here rather than treated as a violation of the format.
 
+## [1.2.0] — honest page verdicts, diffable runs, a scanner that keeps secrets (2026-10-07)
+
+> **Behaviour changes for an existing user:**
+> - A blocked or failed page now makes the run `partial`, exit 6 (it was
+>   `complete`, exit 0, with that page's listings silently missing). A
+>   blocked page 1 now ends the run with exit 3 instead of moving on.
+> - An HTTP error or 404 on every page is exit 5, "never obtained" (it was
+>   exit 4, "zero listings").
+> - A listing that ends before `--pages` is `complete`, exit 0 (it was
+>   `partial`, exit 6).
+> - `diff_runs.py` refuses two runs of different searches, and reports a
+>   listing missing from a window-limited run as `left_selection`, which
+>   `--fail-on-change` ignores, instead of `removed`.
+> - Running the offline suite no longer prints the keys in your `.env`.
+
+### Fixed
+
+From an external audit of v1.1.1 (2026-10-07), each reproduced before it
+was fixed, plus three found while verifying it.
+
+- **`check_no_credentials.py` printed the keys in the user's `.env`.** It
+  walked the whole directory, the git-ignored `.env` included, and printed
+  every match verbatim — so every local `python3 smoke_test.py` reported
+  the user's real configuration as a "committed credential" and wrote it
+  to the terminal. Inside a git work tree it now scans what git could
+  commit (a force-added `.env` is still caught), and a finding is reported
+  as `file:line` and the kind of match, never the text. Not in the audit;
+  found by running the suite with a real `.env` in place.
+- **A blocked page counted as a completed one** (audit P1), in all three
+  engines: a Cloudflare 403 on page 2 behind a good page 1 finished
+  `complete`, exit 0. Worse than the audit stated: a blocked page 1
+  followed by a good page 2 did the same. Every engine now reads the
+  HTTP status (Playwright and pyppeteer from the navigation response,
+  Selenium from Navigation Timing) and takes its verdict from one shared
+  `output_writer.classify_page()`.
+- **An HTTP 500 read as an empty catalogue** (audit P2): exit 4. 429 and
+  5xx are now retried within `--retries`, then count as failed; 404 is
+  not retried. Pages whose status rules out a grid skip the 45 s
+  readiness wait.
+- **`diff_runs.py` compared different searches** (audit P2): two
+  `complete` runs for Gent and Antwerpen diffed as market movement. The
+  sidecar now records `selection`; sidecars from before 1.2.0 have none
+  and are warned about, not refused.
+- **A listing that moved past `--pages` read as removed from the site**
+  (audit P2). Now `left_selection` unless the newer run read the listing
+  to its end (`listing_exhausted`).
+- **An exhausted listing finished `partial`, exit 6** — so `diff_runs.py`
+  refused every such run. Not in the audit. Exhausted pages are now
+  `exhausted_pages`, and the run is `complete`.
+- **The pyppeteer engine could hang forever over `--cdp-endpoint`.** A
+  Scraping Browser profile still busy from the previous page answers the
+  websocket upgrade with HTTP 500; pyppeteer loses that in a background
+  task and `connect()` never returns (measured live: page 1 done, page 2
+  still connecting after ten minutes). Every CDP call is now bounded at
+  60 s and a timeout is retried like any other fetch error — the same
+  live run then finished all three pages. Not in the audit.
+- The Playwright engine's docstring still described the inline JSON array
+  zimmo.be dropped in September.
+
+Measured live on 2026-10-07 through a residential exit, and written into
+`classify_page()`: a served page is 200, Cloudflare's challenge 403, an
+unserved route 404 ("Pagina niet gevonden"), and `?page=999` is 200
+carrying page 1 again.
+
+### Not changed
+
+- One shared page loop instead of three engine copies, separate
+  namespaces for the family's same-named modules, detail-page enrichment,
+  coordinates, agency, URL batches, checkpoint/resume — product and
+  architecture decisions, not defects; raised for discussion.
+- An empty search: zimmo.be answered every empty search tried with 404,
+  so a "confirmed empty" page could not be told apart from a wrong URL.
+  Both now end with exit 5 rather than claiming the catalogue was empty.
+
 ## [1.1.1] — pyppeteer proxy auth, .gitignore by shape (2026-09-29)
 
 > **Behaviour change for an existing user:** with the pyppeteer engine, an
