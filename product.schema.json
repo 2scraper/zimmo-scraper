@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "zimmo-scraper row",
+  "description": "One listing, as written to <out>.json and <out>.csv. Every key is always present; an unknown value is null.",
+  "x-schema-version": 2,
+  "type": "object",
+  "properties": {
+    "source": {
+      "type": "string"
+    },
+    "scraped_at": {
+      "type": "string"
+    },
+    "url": {
+      "type": "string"
+    },
+    "sku": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "brand": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "price": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "currency": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "original_price": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "discount_pct": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "image_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "category": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "listing_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "property_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "location": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "surface_m2": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "bedrooms": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "epc_label": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "epc_value": {
+      "type": [
+        "number",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "source",
+    "scraped_at",
+    "url",
+    "sku",
+    "title",
+    "brand",
+    "price",
+    "currency",
+    "original_price",
+    "discount_pct",
+    "image_url",
+    "category",
+    "listing_type",
+    "property_type",
+    "location",
+    "surface_m2",
+    "bedrooms",
+    "epc_label",
+    "epc_value"
+  ],
+  "additionalProperties": false
+}

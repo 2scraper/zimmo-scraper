@@ -3,6 +3,7 @@
 *.json
 *.csv
 !sample_output.json
+!product.schema.json
 !sample_output.csv
 zimmo_listings.*
 *_debug.html

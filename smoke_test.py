@@ -286,6 +286,59 @@ def main() -> int:
         return 1
 
 
+def check_output_schema_and_removed_columns() -> bool:
+    """product.schema.json is generated from Product, the sample file is
+    cut to it, and the three columns removed in 1.3.0 stay removed."""
+    import json as _json
+    import csv as _csv
+    from dataclasses import fields as _fields
+    import output_writer as ow
+    ok = True
+    on_disk = _json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "product.schema.json"), encoding="utf-8"))
+    ok &= check("product.schema.json equals output_writer.json_schema() (regenerate with "
+                "`python3 output_writer.py > product.schema.json`)", on_disk == ow.json_schema())
+    names = [f.name for f in _fields(ow.Product)]
+    ok &= check("schema lists exactly Product's columns, in order, all required",
+                list(on_disk["properties"]) == names and on_disk["required"] == names)
+    ok &= check("removed columns are not in Product again (rating/review_count/in_stock)",
+                not set(ow.REMOVED_COLUMNS) & set(names))
+    types = {"string": str, "number": (int, float), "integer": int, "boolean": bool, "null": type(None)}
+    rows = _json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_output.json"), encoding="utf-8"))
+    bad = []
+    for r in rows:
+        if set(r) != set(names):
+            bad.append(("keys", sorted(set(r) ^ set(names))))
+        for k, v in r.items():
+            t = on_disk["properties"].get(k, {}).get("type", [])
+            t = [t] if isinstance(t, str) else t
+            if isinstance(v, bool) and "boolean" not in t:
+                bad.append((k, v))
+            elif not any(isinstance(v, types[x]) for x in t):
+                bad.append((k, v))
+    ok &= check("every row of sample_output.json validates against the schema", not bad)
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_output.csv"), newline="", encoding="utf-8") as fh:
+        ok &= check("sample_output.csv header equals the schema's columns",
+                    next(_csv.reader(fh)) == names)
+    return ok
+
+
+def check_canary_is_skipped_not_green_without_a_proxy() -> bool:
+    """The live job must hang off a gate on the proxy secret, so with none
+    set it is SKIPPED. The old behaviour (run, get refused, exit 0 with a
+    notice) read as a pass."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".github", "workflows", "canary.yml")
+    if not os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".github")):
+        return check("canary gate (no .github directory: skipped, e.g. inside the image)", True)
+    text = open(path, encoding="utf-8").read()
+    ok = check("canary job needs the gate and runs only when it saw a proxy",
+               "needs: gate" in text and "needs.gate.outputs.has_proxy == 'true'" in text)
+    ok &= check("no run-then-forgive branch is left (exit 3 without a proxy)",
+                "code == 3 and not has_proxy" not in text)
+    ok &= check("canary asserts unique skus and plausible prices",
+                "duplicate skus" in text and "implausible price" in text)
+    return ok
+
+
 # --- Wording enforced by this test (CLAUDE.md §12) ---
 # Guard names and dead features too (CLAUDE.md §10): costs nothing, and
 # catches an editor reintroducing either. Scanned against every .py file
@@ -1362,6 +1415,8 @@ if __name__ == "__main__":
     epc_regression_ok = check_epc_label_natural_language_regression()
     unattempted_ok = check_unattempted_pages_prevent_false_complete()
     no_sku_dedup_ok = check_no_sku_rows_participate_in_dedup()
+    schema_ok = check_output_schema_and_removed_columns()
+    canary_gate_ok = check_canary_is_skipped_not_green_without_a_proxy()
     exit_code = main()
     overall_ok = (wording_ok and env_ok and env_roundtrip_ok and credentials_ok
                   and engine_import_ok and ast_ok and flags_ok and signatures_ok
@@ -1369,5 +1424,6 @@ if __name__ == "__main__":
                   and price_no_swallow_ok and pagination_param_ok
                   and epc_regression_ok and css_fallback_scope_ok and live_tiles_ok and item_link_selector_ok
                   and unattempted_ok and no_sku_dedup_ok and audit_2026_10_07_ok
+                  and schema_ok and canary_gate_ok
                   and exit_code == 0)
     sys.exit(0 if overall_ok else 1)

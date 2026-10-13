@@ -34,9 +34,6 @@ class Product:
     currency: Optional[str] = "EUR"
     original_price: Optional[float] = None
     discount_pct: Optional[float] = None
-    rating: Optional[float] = None
-    review_count: Optional[int] = None
-    in_stock: Optional[bool] = None
     image_url: Optional[str] = None
     category: Optional[str] = None
     listing_type: Optional[str] = None
@@ -57,6 +54,43 @@ class Product:
         certainly NOT the same listing and must never collapse into
         one."""
         return f"sku:{self.sku}" if self.sku else f"url:{self.url}"
+
+
+# Columns that were REMOVED in 1.3.0, kept as a named list so a check can
+# assert they stay gone. All three came with the family's shop-shaped row
+# and nothing in this repo ever assigned them: 0 of 21 rows in the real
+# 2026-09-23 capture, and no assignment anywhere in product_parser.py.
+# Put one back only with a measurement that it is populated.
+REMOVED_COLUMNS = ("rating", "review_count", "in_stock")
+
+SCHEMA_VERSION = 2   # 1 = the 1.0-1.2 row with the three columns above
+
+
+def json_schema() -> dict:
+    """JSON Schema (draft 2020-12) for one row, generated from `Product` so
+    it cannot drift from the dataclass. Published as product.schema.json;
+    smoke_test.py fails if that file differs from this output."""
+    import typing
+    hints = typing.get_type_hints(Product)
+    props, required = {}, []
+    for f in fields(Product):
+        hint = hints[f.name]
+        inner = [a for a in typing.get_args(hint) if a is not type(None)] or [hint]
+        t = {str: "string", float: "number", int: "integer", bool: "boolean"}[inner[0]]
+        nullable = type(None) in typing.get_args(hint)
+        props[f.name] = {"type": [t, "null"] if nullable else t}
+        required.append(f.name)
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "zimmo-scraper row",
+        "description": ("One listing, as written to <out>.json and <out>.csv. "
+                        "Every key is always present; an unknown value is null."),
+        "x-schema-version": SCHEMA_VERSION,
+        "type": "object",
+        "properties": props,
+        "required": required,
+        "additionalProperties": False,
+    }
 
 
 EXIT_OK = 0
@@ -327,3 +361,8 @@ def dedupe_by_sku(products: List[Product]) -> List[Product]:
         seen.add(key)
         result.append(p)
     return result
+
+
+if __name__ == "__main__":
+    import json as _json
+    print(_json.dumps(json_schema(), indent=2))

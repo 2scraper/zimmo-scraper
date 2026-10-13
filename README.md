@@ -274,9 +274,23 @@ assertions on the share of rows carrying a price, living area, bedrooms,
 energy grade and property type. It needs a residential exit to pass —
 measured 2026-09-23, GitHub's runner is refused like any datacentre
 address — so it takes one from a `ZIMMO_PROXY` repository secret, and
-without that secret a refusal ends in a `::notice::` saying so rather
-than a red badge. Read the badge with that in mind: green without the
-secret means "tried, refused as documented", not "tested".
+without that secret the live job is **skipped** (a `gate` job prints a
+`::notice::` saying why) instead of running a request that is refused
+every time. A skipped run is not a pass: GitHub still draws the badge
+green for a workflow whose only live job was skipped, so open the run
+and check that the `canary` job ran before reading the badge as "tested".
+Besides the share of populated columns it asserts the arithmetic of the
+data: every row has a unique `sku`, prices fall in a plausible range, no
+`original_price` sits at or below its `price`, and every URL is on
+zimmo.be.
+
+## Output schema
+
+`product.schema.json` is a JSON Schema (draft 2020-12) for one row,
+generated from the `Product` dataclass by `python3 output_writer.py` and
+checked for drift by `smoke_test.py`, so a consumer outside Python can
+validate a run. `x-schema-version` goes up whenever a column is added,
+renamed or removed, and the CHANGELOG says so.
 
 ## Repo maintenance notes (not shipped behaviour)
 
