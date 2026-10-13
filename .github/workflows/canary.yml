@@ -18,7 +18,29 @@ on:
       - ".github/workflows/canary.yml"
 
 jobs:
+  # `secrets` is not available in a job-level `if`, so presence is tested
+  # here and handed on as an output. The canary job below is then SKIPPED
+  # (shown as skipped, not as a green run) when no ZIMMO_PROXY is set: a
+  # run from the runner's own address is refused by Cloudflare every time
+  # (README, "What you need"), so running it would test nothing and
+  # reporting it as a pass would be a claim nobody measured.
+  gate:
+    runs-on: ubuntu-22.04
+    env:
+      HAS_ZIMMO_PROXY: ${{ secrets.ZIMMO_PROXY != '' }}
+    outputs:
+      has_proxy: ${{ steps.g.outputs.has_proxy }}
+    steps:
+      - id: g
+        run: |
+          echo "has_proxy=$HAS_ZIMMO_PROXY" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_ZIMMO_PROXY" != "true" ]; then
+            echo "::notice::canary SKIPPED, not passed: no ZIMMO_PROXY secret is set, and zimmo.be refuses this runner's address. The site needs a residential exit plus a headful browser (README, 'What you need'). Add a residential proxy as the ZIMMO_PROXY repository secret to make this canary test the scraper daily."
+          fi
+
   canary:
+    needs: gate
+    if: needs.gate.outputs.has_proxy == 'true'
     # jammy, pinned, for the same reason tests.yml's engine-smoke job
     # pins it: playwright==1.44.0 cannot install its system deps on
     # Ubuntu 24.04, and the Dockerfile's base image is v1.44.0-jammy.
@@ -26,13 +48,9 @@ jobs:
     # What zimmo.be lets through, measured 2026-09-23 (README, "What you
     # need"): a residential exit AND a visible (headful) browser. Headless
     # Chromium is refused even from a Belgian home address, and a
-    # datacentre address is refused either way. Until that date this job
-    # was gated on TWOCAPTCHA_KEY -- a secret that buys nothing here, was
-    # never set, and so made the canary SKIP every day while its badge
-    # read green. The gate is now on ZIMMO_PROXY, the thing that actually
-    # decides whether a run can pass; see the step notes below.
+    # datacentre address is refused either way.
     env:
-      HAS_ZIMMO_PROXY: ${{ secrets.ZIMMO_PROXY != '' }}
+      HAS_ZIMMO_PROXY: "true"
     steps:
       - uses: actions/checkout@v4
 
@@ -54,11 +72,7 @@ jobs:
           ZIMMO_PROXY: ${{ secrets.ZIMMO_PROXY }}
         run: |
           set +e
-          if [ "$HAS_ZIMMO_PROXY" = "true" ]; then
-            echo "[canary] route: headful Chromium under xvfb, through ZIMMO_PROXY"
-          else
-            echo "[canary] route: headful Chromium under xvfb, no proxy (the runner's own address)"
-          fi
+          echo "[canary] route: headful Chromium under xvfb, through ZIMMO_PROXY"
           xvfb-run -a python playwright_scraper.py \
             --url "https://www.zimmo.be/nl/gent-9000/te-koop/" \
             --pages 3 \
@@ -76,17 +90,6 @@ jobs:
           import json, os, sys
 
           code = int(os.environ.get("exit_code", "1"))
-          has_proxy = os.environ.get("HAS_ZIMMO_PROXY") == "true"
-          if code == 3 and not has_proxy:
-              # Blocked from the runner's own address with no proxy
-              # configured: the documented access condition, not a
-              # scraper bug. A canary that cannot pass must say so
-              # rather than go red every day (CLAUDE.md §11).
-              print("::notice::zimmo.be refused this runner's address (exit 3) and no ZIMMO_PROXY "
-                    "secret is set. The site needs a residential exit plus a headful browser "
-                    "(README, 'What you need'). Add a residential proxy as the ZIMMO_PROXY "
-                    "repository secret to make this canary test the scraper daily.")
-              sys.exit(0)
           if code != 0:
               print(f"::error::engine exit code {code} (0 ok, 3 blocked, 4 zero rows, 5 content never obtained, 6 partial)")
               sys.exit(1)
@@ -114,6 +117,18 @@ jobs:
           assert share("surface_m2") >= 0.6, "surface_m2 share"
           assert share("bedrooms") >= 0.4, "bedrooms share"
           assert share("epc_label") >= 0.4, "epc_label share"
+          # A page that answers 200 and parses to rows can still be a
+          # parser that has drifted. These are the arithmetic of the data.
+          skus = [r["sku"] for r in rows if r.get("sku")]
+          assert len(skus) == n, f"{n - len(skus)} rows have no sku"
+          assert len(set(skus)) == n, f"{n - len(set(skus))} duplicate skus"
+          bad_price = [r["sku"] for r in rows
+                       if r.get("price") is not None and not (10_000 <= r["price"] <= 50_000_000)]
+          assert not bad_price, f"implausible price on {bad_price[:5]}"
+          assert all(r.get("price") is None or r.get("original_price") is None
+                     or r["original_price"] > r["price"] for r in rows), \
+              "an original_price at or below its price"
+          assert all((r.get("url") or "").startswith("https://www.zimmo.be/") for r in rows), "foreign url"
           print("Canary: PASS")
           EOF
 
