@@ -14,4 +14,4 @@ __pycache__/
 .venv*/
 README.md
 CHANGELOG.md
-CLAUDE.md
+*.md

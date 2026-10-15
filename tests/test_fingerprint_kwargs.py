@@ -3,7 +3,7 @@ tests/test_fingerprint_kwargs.py
 ------------------------------------
 "Assert that a paid API's kwargs are ones the driver accepts. An
 unknown key in new_context(**kwargs) is a TypeError at launch, on the
-paid path, at runtime." (CLAUDE.md §10)
+paid path, at runtime."
 
 Guarded behind try/except ImportError -- skipped, not failed, when
 Playwright isn't installed, since this specifically tests whether

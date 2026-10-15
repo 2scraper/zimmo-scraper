@@ -12,7 +12,7 @@ check_engines_use_shared_page_classification pins that every engine
 really calls it.
 
 Each engine is skipped, not failed, when its driver is not installed
-(CLAUDE.md §10); the engine-smoke CI job runs each in its own venv.
+; the engine-smoke CI job runs each in its own venv.
 """
 
 import asyncio

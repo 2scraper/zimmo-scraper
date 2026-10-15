@@ -7,6 +7,75 @@ manage. A patch release means "fixes" — not that every flag is frozen,
 so a behaviour-changing default landing in a patch is stated plainly
 here rather than treated as a violation of the format.
 
+## [Unreleased]
+
+> **Exit codes.** A page whose listing grid rendered but parsed to zero
+> rows is now a parser failure: exit 5 when no row was recovered, exit 6
+> (`partial`, `parser_failed_pages` in the sidecar) when other pages had
+> rows. It used to be reported as an empty search, exit 4. A run with no
+> rows where one page was served empty and another failed is now exit 5,
+> not 4, and the Scraper API path now answers 4 for a served empty page
+> and 3 for a Cloudflare challenge (both were 5).
+>
+> **Rejected flag values (exit 2).** `--retries`, `--delay` and
+> `--retry-delay` below 0, and `--pages`, `--concurrency` and
+> `--proxy-block-retries` below 1, are argparse errors in all three
+> engines (`--retries -1` used to run no navigation at all and report exit
+> 5; `--retries 0` still means one attempt). `--proxy`/`--proxy-file`
+> together with `--cdp-endpoint` (from flags or `.env`) is refused instead
+> of the proxy being silently ignored. `--captcha-api` is removed: nothing
+> ever read it.
+>
+> **CSV cells and file modes.** In the CSV only, a text cell starting with
+> `=`, `+`, `-`, `@`, a tab, CR or LF gets a leading apostrophe so a
+> spreadsheet does not run it as a formula; numbers and the JSON are
+> unchanged, and the sidecar counts the escaped cells in
+> `csv_cells_escaped`. Output files keep an existing file's mode; a new one
+> gets what the umask allows, as before.
+
+### Fixed
+
+- Output files (`.json`, `.csv`, `.meta.json`) are written to a temporary
+  file in the same directory and moved into place only when complete, so a
+  failed or interrupted write leaves the previous good file intact instead
+  of truncated.
+- One page buys at most one paid captcha solve, however many attempts,
+  proxy rotations or challenge markers it goes through. The allowance is
+  checked before each purchase in all three engines; a missing key or an
+  unsolvable Managed Challenge costs nothing and does not use it up.
+- `currency` is null when nothing states one (it defaulted to `EUR` on the
+  embedded-JSON and JSON-LD paths, which today's pages do not use).
+- The credential scan now also reads `.json`, `.csv`, `.html` and `.cfg`
+  files, recognises a virtualenv by its `pyvenv.cfg` under any name,
+  judges the `sample_output` exemption by file name rather than by the
+  whole path, and refuses to report a tree clean when it read no file.
+- README: the Scraping Browser credential lifetime is no longer stated as
+  "about a day"; an HTTP 401 on connect is described as credentials no
+  longer accepted. The Docker image is documented as needing
+  `--cdp-endpoint` or a display, and the Dockerfile no longer claims a CI
+  step that did not exist (the offline suite now checks its COPY list).
+- Comments, docs and tests no longer cite private maintainer notes; each
+  rule is stated in place. The offline suite fails if such a citation
+  returns.
+
+### Changed
+
+- The canary no longer skips green: without a usable `ZIMMO_PROXY` secret
+  (missing or empty) it fails with an error naming it, because zimmo.be
+  refuses GitHub's runners and a run that never reached the site tested
+  nothing. Any nonzero exit (block, zero rows, parser failure, partial)
+  is red.
+
+### Not changed
+
+- Challenge markers (`turnstile`, `cf-turnstile-response`) that a Scraping
+  Browser session may inject: changing them needs real served and refused
+  captures over `--cdp-endpoint`, which this change did not take.
+- The family flags `--fingerprint`, `--fp-*`, `--locale` and `--mode`, and
+  whether to keep `fingerprint_client.py`: an owner decision.
+- The three per-engine fetch loops (no shared-loop refactor); version,
+  tag and release of 1.3.0.
+
 ## [1.3.0] — a published row schema, three columns removed, a canary that can say "not run" (2026-10-13)
 
 > **Output change.** `rating`, `review_count` and `in_stock` are gone from
@@ -411,7 +480,7 @@ fixed, and each has its own regression test in `smoke_test.py`.
   confirmed live via the proxy provider's own usage dashboard, not
   just this project's own output.
 
-## [0.3.0] — External audit fixes (codex.md, 2026-09-14)
+## [0.3.0] — External audit fixes (2026-09-14)
 
 An independent audit ran this project against the live site and its own
 test suite and found ten confirmed defects, several severe. Every
@@ -573,7 +642,7 @@ patched on the audit's word alone — see each item for how.
   match the family default. JSON-LD parsing now also handles `@graph`
   and an `image` field shaped as an `ImageObject` dict. `SELECTORS`'
   key renamed from an ad-hoc `item_link_css_approx` to the family's own
-  `item_link` convention (CLAUDE.md §5).
+  `item_link` convention.
 - `env_config.py`: a value containing `{...}` (a vendor's own braced
   placeholder, e.g. `ws://{login}-zone-...`) is now treated as unset,
   not just a fixed literal list — a copied `.env.example` following the

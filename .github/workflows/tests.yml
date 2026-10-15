@@ -1,6 +1,6 @@
 name: tests
 
-# Offline only (CLAUDE.md §11) — nothing here touches zimmo.be or a
+# Offline only — nothing here touches zimmo.be or a
 # credential. See canary.yml for the one real live run.
 on:
   push:
@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         # Oldest and newest supported Python — claiming 3.9 without
-        # testing it is how a walrus operator ships (CLAUDE.md §11).
+        # testing it is how a walrus operator ships.
         python-version: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -107,7 +107,7 @@ jobs:
           python-version: "3.12"
 
       # One venv per engine, installed from its OWN requirements file
-      # (CLAUDE.md §11) — a single shared environment lets pip silently
+      # — a single shared environment lets pip silently
       # resolve the family's mutually-unsatisfiable pins by reaching
       # for whatever it can, which stays green against a version
       # nobody ships.
@@ -141,7 +141,7 @@ jobs:
   docker-build:
     runs-on: ubuntu-latest
     # "Build the Docker image in CI. Nothing else does, which is how
-    # all three [sibling] repos shipped a broken one." (CLAUDE.md §11)
+    # all three [sibling] repos shipped a broken one."
     # Four steps, each catching a DISTINCT failure a manual COPY-list
     # review cannot: the image builds; its entrypoint actually runs;
     # Chromium actually launches (not just `playwright install
@@ -173,7 +173,7 @@ jobs:
         run: |
           docker create --name zimmo-check zimmo-scraper:ci --help
           FOUND=0
-          for forbidden in .env tests sample_output.json sample_output.csv README.md CLAUDE.md; do
+          for forbidden in .env tests sample_output.json sample_output.csv README.md CHANGELOG.md CONTRIBUTING.md; do
             if docker cp zimmo-check:/app/$forbidden /tmp/should-not-exist 2>/dev/null; then
               echo "FORBIDDEN: /app/$forbidden exists inside the image"
               rm -rf /tmp/should-not-exist

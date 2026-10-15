@@ -2,8 +2,9 @@
 
 Thanks for considering a contribution. This repo is part of the
 [2scraper](https://github.com/2scraper) family — several single-site
-scrapers sharing one architecture (`~/2scraper/CLAUDE.md`, not committed
-to this repo, describes it in full for maintainers).
+scrapers sharing one architecture: shared modules with no site knowledge
+(`output_writer.py`, `env_config.py`, `proxy_pool.py`, `captcha_solver.py`)
+and the site itself confined to `product_parser.py`.
 
 ## Before you start
 

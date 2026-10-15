@@ -7,7 +7,7 @@ docstring for the full reasoning. Uses plain `asyncio.run()` inside
 ordinary sync test functions rather than adding a pytest-asyncio
 dependency for one test file.
 
-Guarded behind try/except ImportError (CLAUDE.md §10) -- skipped, not
+Guarded behind try/except ImportError -- skipped, not
 failed, when pyppeteer is not installed.
 """
 

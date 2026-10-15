@@ -8,7 +8,7 @@ requested. Two real-world reCAPTCHA v3 markup formats have been
 confirmed live on different sites in this scraper family, and both are
 checked here.
 
-FIXED (external audit, 2026-09-14, codex.md finding #2): the live
+FIXED (external audit, 2026-09-14, finding #2): the live
 zimmo.be page at audit time presented a Cloudflare **Managed
 Challenge** -- a hidden `cf-turnstile-response` input exists, but there
 is no `<div class="cf-turnstile" data-sitekey="...">` element the old
@@ -64,6 +64,36 @@ logger = logging.getLogger("captcha_solver")
 
 TWOCAPTCHA_IN_URL = "https://2captcha.com/in.php"
 TWOCAPTCHA_RES_URL = "https://2captcha.com/res.php"
+
+
+# --- Paid-solve allowance ---------------------------------------------------
+#
+# Every 2captcha.com solve is a purchase. One page gets at most
+# SOLVES_PER_PAGE of them, however many attempts, proxy rotations or
+# challenge markers that page goes through: an engine creates ONE
+# SolveBudget per page before its attempt loop and hands it to every
+# solve call, and both solve functions below take it as a required
+# argument and spend it immediately before submitting the task -- never
+# after a token has been bought. A missing key or an unsolvable Managed
+# Challenge raises before the purchase and costs nothing.
+SOLVES_PER_PAGE = 1
+
+
+class SolveBudgetExhausted(RuntimeError):
+    pass
+
+
+class SolveBudget:
+    def __init__(self, limit: int = SOLVES_PER_PAGE):
+        self.limit = limit
+        self.used = 0
+
+    def spend(self, what: str) -> None:
+        if self.used >= self.limit:
+            raise SolveBudgetExhausted(
+                f"{what}: this page's paid-solve allowance ({self.limit}) is already "
+                f"spent -- not buying another solve for it.")
+        self.used += 1
 
 
 @dataclass
@@ -154,12 +184,13 @@ def _solve_with_2captcha(api_key: str, challenge: CaptchaChallenge,
 
 
 def solve_recaptcha_v3(challenge: CaptchaChallenge, twocaptcha_api_key: Optional[str],
-                        min_score: Optional[float] = None) -> str:
+                        budget: SolveBudget, min_score: Optional[float] = None) -> str:
     if not twocaptcha_api_key:
         raise RuntimeError(
             "reCAPTCHA v3 detected but no --twocaptcha-key was provided. "
             "Pass --twocaptcha-key or set TWOCAPTCHA_KEY in .env."
         )
+    budget.spend("reCAPTCHA v3")
     kwargs = {} if min_score is None else {"min_score": min_score}
     return _solve_with_2captcha(twocaptcha_api_key, challenge, **kwargs)
 
@@ -262,7 +293,8 @@ def _solve_turnstile_with_2captcha(api_key: str, challenge: TurnstileChallenge,
     raise TimeoutError("2captcha.com did not return a Turnstile token in time")
 
 
-def solve_turnstile(challenge: TurnstileChallenge, twocaptcha_api_key: Optional[str]) -> str:
+def solve_turnstile(challenge: TurnstileChallenge, twocaptcha_api_key: Optional[str],
+                    budget: SolveBudget) -> str:
     """Raises a clear, actionable error for the sitekey=None case
     (audit finding #2) rather than submitting a nonsensical request to
     2captcha's API and getting back a confusing remote error."""
@@ -278,6 +310,7 @@ def solve_turnstile(challenge: TurnstileChallenge, twocaptcha_api_key: Optional[
             "Turnstile challenge detected but no --twocaptcha-key was provided. "
             "Pass --twocaptcha-key or set TWOCAPTCHA_KEY in .env."
         )
+    budget.spend("Turnstile")
     return _solve_turnstile_with_2captcha(twocaptcha_api_key, challenge)
 
 

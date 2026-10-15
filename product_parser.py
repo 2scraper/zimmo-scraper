@@ -32,7 +32,7 @@ JSON array, inline in a <script> tag:
 
 Each object in `properties` was a complete, well-structured listing
 record. This primary path was explicitly confirmed sound by an external
-audit (2026-09-14, codex.md): "Основной embedded-JSON путь обычно
+audit (2026-09-14): "Основной embedded-JSON путь обычно
 избегает этой ошибки" (the primary embedded-JSON path is generally
 immune to the price-parsing bug found in the fallback) -- prices here
 came from `prijs`/`zprijs` as already-numeric JSON fields, never
@@ -356,7 +356,8 @@ def _parse_jsonld(html: str, base_url: str) -> List[Product]:
                 sku=node.get("sku") or node.get("productID"),
                 title=node.get("name"),
                 price=_to_float(str(price)) if price is not None else None,
-                currency=offers.get("priceCurrency", "EUR"),
+                # No stated currency is null, never an assumed EUR.
+                currency=offers.get("priceCurrency") or None,
                 image_url=_extract_image_url(node.get("image")),
                 location=location,
             ))
@@ -659,6 +660,8 @@ def _parse_properties_json(html: str, base_url: str, category: Optional[str]) ->
             title=title,
             brand=advertiser.get("name") if isinstance(advertiser, dict) else None,
             price=price,
+            # A price on zimmo.be's own JSON is in euro; no price, no currency.
+            currency="EUR" if price is not None else None,
             original_price=original_price,
             discount_pct=discount_pct,
             image_url=item.get("hoofdFoto"),

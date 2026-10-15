@@ -200,7 +200,7 @@ def main() -> int:
     no_turnstile = detect_turnstile_challenge(SAMPLE_LISTING_HTML, "https://www.zimmo.be/nl/")
     ok &= check("no false-positive Turnstile detection on clean page", no_turnstile is None)
 
-    # --- New in the CLAUDE.md-aligned rewrite: output contract (§9) ---
+    # --- Output contract ---
     from output_writer import finish_run, dedupe_by_sku, write_csv, Product, EXIT_ZERO_PRODUCTS, EXIT_OK
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -225,7 +225,7 @@ def main() -> int:
         code_never = finish_run([], never_prefix, "both", pages_requested=3, pages_completed=0,
                                 failed_pages=[1], unattempted_pages=[2, 3], allow_empty=True)
         ok &= check("0 rows because no page was ever FETCHED is exit 5, not 4 -- even with "
-                    "--allow-empty, and with nothing written (CLAUDE.md §25)",
+                    "--allow-empty, and with nothing written",
                     code_never == EXIT_FETCH_FAILED == 5
                     and not os.path.exists(never_prefix + ".json")
                     and not os.path.exists(never_prefix + ".meta.json"))
@@ -243,7 +243,7 @@ def main() -> int:
     ok &= check("dedupe_by_sku keeps the FIRST occurrence (page order, not arrival order)",
                 len(deduped) == 2 and deduped[0].url == "first-seen")
 
-    # --- New in the CLAUDE.md-aligned rewrite: JSON-LD edge cases (§4) ---
+    # --- JSON-LD edge cases ---
     SAMPLE_JSONLD_GRAPH_HTML = """
     <html><body>
     <script type="application/ld+json">
@@ -277,7 +277,7 @@ def main() -> int:
 
     print()
     if ok:
-        print("All smoke tests passed. Offline only: the live site is exercised by")
+        print("main() checks passed (the process exit code covers every check). Offline only: the live site is exercised by")
         print("canary.yml, and it needs a residential exit plus a headful browser")
         print("(README, 'What you need').")
         return 0
@@ -322,25 +322,33 @@ def check_output_schema_and_removed_columns() -> bool:
     return ok
 
 
-def check_canary_is_skipped_not_green_without_a_proxy() -> bool:
-    """The live job must hang off a gate on the proxy secret, so with none
-    set it is SKIPPED. The old behaviour (run, get refused, exit 0 with a
-    notice) read as a pass."""
+def check_canary_fails_without_a_proxy() -> bool:
+    """zimmo.be refuses GitHub runners, so the canary needs ZIMMO_PROXY.
+    Until 2026-10-14 a missing (or empty) secret made the live job SKIP
+    while the workflow showed green, and before that a refused run passed
+    with a notice. Neither tested the site. Now the job must FAIL with an
+    error naming the secret, and nothing may skip or forgive the live
+    step."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".github", "workflows", "canary.yml")
     if not os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".github")):
-        return check("canary gate (no .github directory: skipped, e.g. inside the image)", True)
+        return check("canary (no .github directory: skipped, e.g. inside the image)", True)
     text = open(path, encoding="utf-8").read()
-    ok = check("canary job needs the gate and runs only when it saw a proxy",
-               "needs: gate" in text and "needs.gate.outputs.has_proxy == 'true'" in text)
+    ok = check("canary fails with ::error:: naming ZIMMO_PROXY when the secret is empty",
+               '[ -z "$ZIMMO_PROXY" ]' in text and "::error::ZIMMO_PROXY" in text
+               and "exit 1" in text)
+    ok &= check("canary has no job-level skip and no gate that could end green untested",
+                "needs.gate" not in text and "\n    if:" not in text)
     ok &= check("no run-then-forgive branch is left (exit 3 without a proxy)",
-                "code == 3 and not has_proxy" not in text)
+                "code == 3" not in text and "::notice::" not in text)
+    ok &= check("canary fails on any nonzero engine exit and asserts a row floor",
+                "if code != 0:" in text and "n >= 50" in text)
     ok &= check("canary asserts unique skus and plausible prices",
                 "duplicate skus" in text and "implausible price" in text)
     return ok
 
 
-# --- Wording enforced by this test (CLAUDE.md §12) ---
-# Guard names and dead features too (CLAUDE.md §10): costs nothing, and
+# --- Wording enforced by this test ---
+# Guard names and dead features too: costs nothing, and
 # catches an editor reintroducing either. Scanned against every .py file
 # actually shipped in this repo, not just the ones this test happens to
 # import, since a banned phrase left in a docstring/help string would
@@ -366,9 +374,9 @@ _SHIPPED_PY_FILES = (
 # The text a reader actually sees. Until 2026-09-23 only the .py files
 # above were scanned, so the README's own tagline and pyproject.toml's
 # package description both carried the first banned phrase under a green
-# suite (CLAUDE.md §21: a wording check must cover what the repo
-# PUBLISHES). CHANGELOG.md is left out on purpose: its released sections
-# are history (§19), and two of them name removed features in order to
+# suite (a wording check must cover what the repo PUBLISHES).
+# CHANGELOG.md is left out on purpose: its released sections are history,
+# and two of them name removed features in order to
 # say they were removed.
 _SHIPPED_TEXT_FILES = (
     "README.md", "pyproject.toml", ".env.example", "Dockerfile",
@@ -403,7 +411,7 @@ def check_banned_wording() -> bool:
 
 
 def check_docker_playwright_version_pins_match() -> bool:
-    """FIXED (external audit, 2026-09-14, codex.md finding #7): the
+    """FIXED (external audit, 2026-09-14, finding #7): the
     Dockerfile's base image bundles a browser matched to a SPECIFIC
     playwright version; requirements-playwright.txt must pin that exact
     same version, not a >= range, or `pip install` can put a newer
@@ -596,7 +604,7 @@ LIVE_ANGULAR_TILES_HTML = r'''
 
 
 def check_live_angular_tiles() -> bool:
-    """Values, not coverage (CLAUDE.md §10), on the markup the site serves
+    """Values, not coverage, on the markup the site serves
     today. Before 2026-09-23 bedrooms, EPC and property_type were None on
     every row of every run, KLQRM vanished from the output, LR7M2's area
     read as 2.578 m2 and LRZ2M's commercial surface was written into
@@ -706,7 +714,7 @@ def check_pagination_uses_confirmed_page_param() -> bool:
 def check_price_parser_does_not_swallow_adjacent_numbers() -> bool:
     """Regression test for a bug found via a REAL live run against
     zimmo.be (2026-09-16, one iteration AFTER the audit's own price-
-    parsing fixes): the fix for codex.md finding #8 allowed a bare
+    parsing fixes): the fix for finding #8 allowed a bare
     SPACE as a thousands-grouping character inside the captured price
     digits, in addition to '.'. This was confirmed live to be actively
     dangerous: BeautifulSoup's get_text(" ", strip=True) joins every
@@ -741,7 +749,7 @@ def check_price_parser_does_not_swallow_adjacent_numbers() -> bool:
 
 def check_price_parser_audit_regressions() -> bool:
     """Regression test for the EXACT cases an external audit
-    (2026-09-14, codex.md finding #8) found broken: "€ 1250" read as
+    (2026-09-14, finding #8) found broken: "€ 1250" read as
     125.0, "1250 €" read as 250.0, "€10000" read as 100.0, and Belgian
     thousands-grouped "325.000" read as 325 instead of 325000. Locks
     these specific inputs in place so a future edit to the price regex
@@ -771,7 +779,7 @@ def check_price_parser_audit_regressions() -> bool:
 
 
 def check_unattempted_pages_prevent_false_complete() -> bool:
-    """FIXED (external audit, 2026-09-14, codex.md finding #5): a run
+    """FIXED (external audit, 2026-09-14, finding #5): a run
     with unattempted_pages previously could still report
     status=complete, exit 0, since finish_run() didn't accept or act on
     that parameter at all -- confirmed live: pages_requested=5,
@@ -801,7 +809,7 @@ def check_unattempted_pages_prevent_false_complete() -> bool:
 
 
 def check_no_sku_rows_participate_in_dedup() -> bool:
-    """FIXED (external audit, 2026-09-14, codex.md finding #9): a
+    """FIXED (external audit, 2026-09-14, finding #9): a
     Product with no `sku` (common from the JSON-LD/CSS fallback paths)
     previously bypassed deduplication entirely -- two rows for the
     exact same URL, both with sku=None, both survived dedupe_by_sku()."""
@@ -820,7 +828,7 @@ def check_no_sku_rows_participate_in_dedup() -> bool:
 
 
 def check_env_example_matches_env_keys() -> bool:
-    """CLAUDE.md §3: .env.example must document exactly the variables the
+    """.env.example must document exactly the variables the
     code reads -- a documented-but-unread variable is worse than an
     undocumented one, and drifts silently otherwise."""
     from env_config import ENV_KEYS
@@ -855,7 +863,7 @@ def check_env_example_matches_env_keys() -> bool:
     return ok
 
 
-# --- Round-trip .env.example through the REAL loader (CLAUDE.md §17) ---
+# --- Round-trip .env.example through the REAL loader ---
 # "A copied .env.example read as CONFIGURED": a literal placeholder set can
 # only ever catch strings someone already thought to add, and a vendor's
 # own braced example (`ws://{login}-zone-...`) sailed straight through an
@@ -867,13 +875,7 @@ def check_env_example_matches_env_keys() -> bool:
 # Only CREDENTIAL-bearing variables need to round-trip as unset --
 # ZIMMO_URL is ordinary configuration, not a secret, and .env.example
 # giving it a real, working example value is good practice, not the bug
-# class this check exists for. CLAUDE.md §17's own wording is specific to
-# "the two credentialled URLs", not every documented variable.
-# Only CREDENTIAL-bearing variables need to round-trip as unset --
-# ZIMMO_URL is ordinary configuration, not a secret, and .env.example
-# giving it a real, working example value is good practice, not the bug
-# class this check exists for. CLAUDE.md §17's own wording is specific to
-# "the two credentialled URLs", not every documented variable.
+# class this check exists for, which is about the credentialled values.
 _SECRET_ENV_KEYS = {"TWOCAPTCHA_KEY", "ZIMMO_CDP_ENDPOINT", "ZIMMO_PROXY"}
 
 
@@ -901,8 +903,8 @@ def check_env_example_round_trips_as_unset() -> bool:
 
 
 def check_no_committed_credentials() -> bool:
-    """Invokes the SAME implementation tests.yml calls (CLAUDE.md §16 --
-    "one implementation, invoked from both CI and the offline suite").
+    """Invokes the SAME implementation tests.yml calls -- one
+    implementation, invoked from both CI and the offline suite.
     check_no_credentials.py has no dependency on this project's own
     modules, so importing it here costs nothing and cannot create a
     circular import."""
@@ -918,7 +920,7 @@ def check_no_committed_credentials() -> bool:
     return True
 
 
-# --- Engine import check (CLAUDE.md §10) ---
+# --- Engine import check ---
 # "It must pass with no engine library installed at all. Guard every
 # import playwright_scraper / puppeteer_scraper / selenium_scraper behind
 # try/except ImportError and record the skip." A skip (engine's own
@@ -946,7 +948,7 @@ def check_engine_imports() -> bool:
     return ok
 
 
-# --- Coarse AST name-resolution check (CLAUDE.md §10) ---
+# --- Coarse AST name-resolution check ---
 # "compileall proves a file PARSES, not that its names RESOLVE." A
 # module can import cleanly, pass --help, pass compileall and the whole
 # offline suite, and still die with NameError on a line only reached
@@ -975,8 +977,8 @@ def _collect_bound_names(tree: ast.AST) -> set:
             # A lambda's own parameter (e.g. `lambda d: d.find_elements(...)`,
             # the Selenium WebDriverWait idiom) is bound only inside that
             # lambda's own body -- but this check is deliberately coarse
-            # and whole-module (CLAUDE.md §10: "keep it coarse ... so it
-            # under-reports rather than inventing problems"), so treating
+            # and whole-module (keep it coarse, so it
+            # under-reports rather than inventing problems), so treating
             # it as bound module-wide is the intentional trade-off, not a
             # missed scope rule.
             for arg in node.args.args + node.args.kwonlyargs + node.args.posonlyargs:
@@ -1033,7 +1035,7 @@ def check_ast_names_resolved() -> bool:
     return ok
 
 
-# --- Engine flag-set consistency (CLAUDE.md §10) ---
+# --- Engine flag-set consistency ---
 # "Assert the engines' flag sets against the contract AND against each
 # other, in both directions. A missing flag fails; so does closing a
 # difference the README documents." Extracted via a coarse AST scan of
@@ -1045,7 +1047,7 @@ _CONTRACT_FLAGS = {
     "--url", "--pages", "--category", "--format", "--out", "--delay",
     "--retries", "--retry-delay", "--concurrency", "--proxy", "--proxy-file",
     "--proxy-rotate", "--proxy-shuffle", "--proxy-block-retries",
-    "--twocaptcha-key", "--captcha-api", "--solve-captcha", "--min-score",
+    "--twocaptcha-key", "--solve-captcha", "--min-score",
     "--cdp-endpoint", "--allow-empty", "--dump-html", "--headless", "--headful",
 }
 
@@ -1115,13 +1117,13 @@ def check_engine_flag_sets_consistent() -> bool:
     return ok
 
 
-# --- Shared-function call-signature binding (CLAUDE.md §10) ---
+# --- Shared-function call-signature binding ---
 # "Bind every shared-module call in every engine against the callee's
 # real signature -- inspect.signature(fn).bind(*placeholders) over an
 # ast walk." A signature drifting from its callers is invisible to
 # import, --help, compileall and the whole offline suite, because none
-# of those calls a function the way a live run does -- CLAUDE.md's own
-# example crashed on the FIRST fetch of every affected engine.
+# of those calls a function the way a live run does -- the case that
+# prompted this check crashed on the FIRST fetch of every affected engine.
 _SHARED_MODULE_FUNCTIONS = {}
 for _mod_name in ("captcha_solver", "product_parser", "output_writer",
                    "env_config", "proxy_pool"):
@@ -1137,7 +1139,7 @@ for _mod_name in ("captcha_solver", "product_parser", "output_writer",
 
 def _placeholder_for(annotation) -> object:
     return None  # a generic placeholder -- this check tests ARITY/keyword
-                 # names bind, not type-correctness (CLAUDE.md §10's own
+                 # names bind, not type-correctness (the
                  # technique: bind(*placeholders), not a full type-check)
 
 
@@ -1176,7 +1178,7 @@ def check_shared_call_signatures() -> bool:
 
             # Skip a call site using **kwargs/*args spread -- this coarse
             # check can't resolve what's actually inside those at
-            # static-analysis time, and CLAUDE.md §10 prefers under-
+            # static-analysis time, and it prefers under-
             # reporting to a false positive here.
             if any(isinstance(a, ast.Starred) for a in node.args):
                 continue
@@ -1209,7 +1211,7 @@ def check_classify_page_contract() -> bool:
     (output_writer.py's comment above classify_page)."""
     from output_writer import (classify_page, page_outcome_is_ok, should_retry_page,
                                PAGE_CONTENT, PAGE_EMPTY, PAGE_BLOCKED,
-                               PAGE_NOT_FOUND, PAGE_FETCH_ERROR)
+                               PAGE_NOT_FOUND, PAGE_FETCH_ERROR, PAGE_PARSER_FAILED)
     # (products, status, challenge, rendered) -> outcome, ok, retry
     cases = [
         ((21, 200, False, True), PAGE_CONTENT, True, False),
@@ -1220,6 +1222,12 @@ def check_classify_page_contract() -> bool:
         ((0, 200, True, False), PAGE_BLOCKED, False, False),    # marker only, status 200
         ((0, None, True, False), PAGE_BLOCKED, False, False),   # status unknown
         ((0, 404, False, False), PAGE_NOT_FOUND, False, False),
+        # The listing grid rendered (> MIN_CARD_MATCHES links) and nothing
+        # parsed: a parser failure, not an empty search (was PAGE_EMPTY).
+        ((0, 200, False, True), PAGE_PARSER_FAILED, False, False),
+        ((0, 200, True, True), PAGE_PARSER_FAILED, False, False),
+        ((0, 403, True, True), PAGE_PARSER_FAILED, False, False),  # cleared challenge, grid unread
+        ((0, None, False, True), PAGE_PARSER_FAILED, False, False),
         ((0, 500, False, False), PAGE_FETCH_ERROR, False, True),
         ((0, 429, False, False), PAGE_FETCH_ERROR, False, True),
         ((0, 400, False, False), PAGE_FETCH_ERROR, False, False),
@@ -1256,7 +1264,7 @@ def check_engines_use_shared_page_classification() -> bool:
         missing = {"classify_page", "page_outcome_is_ok", "should_retry_page"} - calls
         literal_success = [n.lineno for n in ast.walk(fetch)
                            if isinstance(n, ast.Return) and isinstance(n.value, ast.Tuple)
-                           and len(n.value.elts) == 4 and isinstance(n.value.elts[1], ast.Constant)
+                           and len(n.value.elts) >= 4 and isinstance(n.value.elts[1], ast.Constant)
                            and n.value.elts[1].value is True]
         if missing or literal_success:
             print(f"[FAIL] {name}: _fetch_page does not call {sorted(missing)} "
@@ -1387,6 +1395,368 @@ def check_credential_scan_never_opens_ignored_env_or_prints_secrets() -> bool:
     return ok
 
 
+# --- 2026-10-14 audit: output files, CSV formulas, paid solves, verdicts ---
+
+_ENGINE_FILES = ("playwright_scraper.py", "puppeteer_scraper.py", "selenium_scraper.py")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def check_atomic_writes_keep_old_output_and_modes() -> bool:
+    """A write that fails half-way must leave the previous file intact, with
+    no temp file left behind, and a file's mode must be what open() would
+    give it: the existing file's mode, or 0o666 & ~umask for a new one.
+    Before the fix a failed json.dump truncated a 497-byte run.json to 13
+    bytes of invalid JSON."""
+    import stat
+    import output_writer as ow
+    ok = True
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix = os.path.join(tmp, "run")
+        rows = [ow.Product(sku="A", url="u1", title="Huis", price=1.0)]
+        ow.save(rows, prefix, "both")
+        ow.write_meta({"status": "complete"}, prefix)
+        before = {ext: open(prefix + ext, "rb").read() for ext in (".json", ".csv", ".meta.json")}
+
+        class Boom(Exception):
+            pass
+
+        real_dump = json.dump
+
+        def half_dump(obj, f, **kw):
+            f.write("[{\"partial\": ")
+            raise Boom("planted failure")
+
+        json.dump = half_dump
+        try:
+            for fn, args in ((ow.write_json, (rows, prefix + ".json")),
+                             (ow.write_meta, ({"status": "x"}, prefix))):
+                try:
+                    fn(*args)
+                except Boom:
+                    pass
+        finally:
+            json.dump = real_dump
+        real_writer = ow.csv.DictWriter
+
+        class BadWriter(real_writer):
+            def writerow(self, row):
+                raise Boom("planted failure")
+
+        ow.csv.DictWriter = BadWriter
+        try:
+            ow.write_csv(rows, prefix + ".csv")
+        except Boom:
+            pass
+        finally:
+            ow.csv.DictWriter = real_writer
+        after = {ext: open(prefix + ext, "rb").read() for ext in before}
+        ok &= check("a failed write leaves the previous .json/.csv/.meta.json byte-identical",
+                    after == before)
+        ok &= check("a failed write leaves no temp file behind",
+                    sorted(os.listdir(tmp)) == ["run.csv", "run.json", "run.meta.json"])
+
+        modes_ok = True
+        for mask in (0o022, 0o002, 0o077):
+            old = os.umask(mask)
+            try:
+                path = os.path.join(tmp, f"new_{mask:o}.json")
+                ow.write_json(rows, path)
+                got = stat.S_IMODE(os.stat(path).st_mode)
+            finally:
+                os.umask(old)
+            if got != 0o666 & ~mask:
+                print(f"       umask {mask:o}: new file mode {got:o}, expected {0o666 & ~mask:o}")
+                modes_ok = False
+        existing = prefix + ".json"
+        os.chmod(existing, 0o640)
+        ow.write_json(rows, existing)
+        modes_ok &= stat.S_IMODE(os.stat(existing).st_mode) == 0o640
+        ok &= check("new files get 0o666 & ~umask (022/002/077); an existing file keeps its mode",
+                    modes_ok)
+    return ok
+
+
+def check_csv_formula_cells_escaped() -> bool:
+    import csv as _csv
+    import output_writer as ow
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix = os.path.join(tmp, "run")
+        rows = [ow.Product(sku="A", url="https://www.zimmo.be/x/1", title='=HYPERLINK("http://x")',
+                           location="@SUM(1)", brand="-5", category="\tTab", price=-1.0),
+                ow.Product(sku="B", url="https://www.zimmo.be/x/2", title="Huis te koop", price=2.0)]
+        code = ow.finish_run(rows, prefix, "both", pages_requested=1, pages_completed=1)
+        with open(prefix + ".csv", newline="", encoding="utf-8") as fh:
+            got = list(_csv.DictReader(fh))
+        js = json.load(open(prefix + ".json", encoding="utf-8"))
+        meta = json.load(open(prefix + ".meta.json", encoding="utf-8"))
+    ok = check("CSV: formula-shaped text cells get a leading apostrophe",
+               code == 0 and got[0]["title"] == "'=HYPERLINK(\"http://x\")"
+               and got[0]["location"] == "'@SUM(1)" and got[0]["brand"] == "'-5"
+               and got[0]["category"] == "'\tTab" and got[1]["title"] == "Huis te koop")
+    ok &= check("CSV: a negative NUMBER is left numeric; JSON keeps every raw value",
+                got[0]["price"] == "-1.0" and js[0]["title"] == '=HYPERLINK("http://x")'
+                and js[0]["price"] == -1.0)
+    ok &= check("sidecar records csv_cells_escaped", meta.get("csv_cells_escaped") == 4)
+    return ok
+
+
+def check_solve_budget_one_purchase_per_page() -> bool:
+    """Every paid solve spends the page's SolveBudget BEFORE the purchase.
+    Before the fix one page answering 503 with a Turnstile widget bought
+    retries+1 solves, and a page with two markers bought two."""
+    import captcha_solver as cs
+    bought = []
+    real_t, real_r = cs._solve_turnstile_with_2captcha, cs._solve_with_2captcha
+    cs._solve_turnstile_with_2captcha = lambda key, ch, **kw: bought.append("t") or "tok"
+    cs._solve_with_2captcha = lambda key, ch, **kw: bought.append("r") or "tok"
+    try:
+        budget = cs.SolveBudget()
+        turnstile = cs.TurnstileChallenge(sitekey="0x4AAAAAAA", page_url="https://www.zimmo.be/")
+        recaptcha = cs.CaptchaChallenge(kind="recaptcha_v3", sitekey="6Lc", page_url="https://www.zimmo.be/")
+        refused = 0
+        for solve in (lambda: cs.solve_turnstile(turnstile, "stub-key", budget),
+                      lambda: cs.solve_turnstile(turnstile, "stub-key", budget),
+                      lambda: cs.solve_recaptcha_v3(recaptcha, "stub-key", budget)):
+            try:
+                solve()
+            except cs.SolveBudgetExhausted:
+                refused += 1
+        free = cs.SolveBudget()
+        try:
+            cs.solve_turnstile(turnstile, None, free)
+        except RuntimeError:
+            pass
+    finally:
+        cs._solve_turnstile_with_2captcha, cs._solve_with_2captcha = real_t, real_r
+    ok = check("one SolveBudget buys exactly one solve; later calls are refused before purchase",
+               bought == ["t"] and refused == 2)
+    ok &= check("a solve refused for a missing key does not spend the allowance", free.used == 0)
+
+    # Every engine: each solve call passes the budget, and the budget is
+    # created once per page, OUTSIDE the attempt loop (so retries and
+    # proxy rotations share it).
+    for name in _ENGINE_FILES:
+        tree = ast.parse(open(os.path.join(_HERE, name), encoding="utf-8").read())
+        funcs = {n.name: n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name)
+                 and n.func.id in ("solve_turnstile", "solve_recaptcha_v3")]
+        fetch = funcs.get("_fetch_page_attempts") or funcs["_fetch_page"]
+        loop = next(n for n in fetch.body if isinstance(n, (ast.For, ast.AsyncFor)))
+        made_before_loop = any(
+            isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+            and getattr(n.value.func, "id", None) == "SolveBudget"
+            and n.lineno < loop.lineno for n in fetch.body)
+        made_in_loop = any(isinstance(n, ast.Call) and getattr(n.func, "id", None) == "SolveBudget"
+                           for n in ast.walk(loop))
+        passes = all(len(c.args) >= 3 and getattr(c.args[2], "id", None) == "budget" for c in calls)
+        handle_calls = [n for n in ast.walk(loop) if isinstance(n, ast.Call)
+                        and getattr(n.func, "id", None) == "handle_captcha_if_present"]
+        ok &= check(f"{name}: SolveBudget made once per page before the attempt loop and "
+                    f"passed to all {len(calls)} solve call(s)",
+                    calls and made_before_loop and not made_in_loop and passes
+                    and handle_calls and all(len(c.args) == 3 for c in handle_calls))
+    return ok
+
+
+def check_parser_failure_is_not_an_empty_search() -> bool:
+    import output_writer as ow
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "a")
+        code_none = ow.finish_run([], p, "json", pages_requested=1, pages_completed=0,
+                                  failed_pages=[1], parser_failed_pages=[1])
+        wrote_none = os.path.exists(p + ".json")
+        p = os.path.join(tmp, "b")
+        code_some = ow.finish_run([ow.Product(sku="A", url="u")], p, "json", pages_requested=2,
+                                  pages_completed=1, failed_pages=[2], parser_failed_pages=[2])
+        meta = json.load(open(p + ".meta.json"))
+        p = os.path.join(tmp, "c")
+        code_mixed = ow.finish_run([], p, "json", pages_requested=2, pages_completed=1,
+                                   failed_pages=[2])
+    ok = check("rendered grid, zero rows parsed, no rows at all -> exit 5, nothing written",
+               code_none == ow.EXIT_FETCH_FAILED and not wrote_none)
+    ok &= check("rows plus a parser-failed page -> exit 6, partial, stop_reason says parser",
+                code_some == ow.EXIT_PARTIAL and meta["status"] == "partial"
+                and meta["parser_failed_pages"] == [2] and "parser" in meta["stop_reason"])
+    ok &= check("page 1 served empty + page 2 failed is exit 5, not 'empty search' (4)",
+                code_mixed == ow.EXIT_FETCH_FAILED)
+    ok &= check("a row with no price carries no invented currency",
+                ow.Product().currency is None)
+    return ok
+
+
+def check_numeric_flags_rejected_when_negative() -> bool:
+    """--retries -1 used to run ZERO navigations and report exit 5."""
+    import argparse
+    import env_config as ec
+    ok = True
+    for fn, bad, good in ((ec.non_negative_int, ("-1", "-3"), ("0", "2")),
+                          (ec.positive_int, ("0", "-2"), ("1",)),
+                          (ec.non_negative_float, ("-0.5", "nan"), ("0", "1.5"))):
+        for v in bad:
+            try:
+                fn(v)
+                ok = False
+                print(f"       {fn.__name__}({v!r}) accepted")
+            except (argparse.ArgumentTypeError, ValueError):
+                pass
+        for v in good:
+            fn(v)
+    want = {"--retries": "non_negative_int", "--pages": "positive_int",
+            "--concurrency": "positive_int", "--proxy-block-retries": "positive_int",
+            "--delay": "non_negative_float", "--retry-delay": "non_negative_float"}
+    for name in _ENGINE_FILES:
+        tree = ast.parse(open(os.path.join(_HERE, name), encoding="utf-8").read())
+        types_ = {}
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "add_argument" and n.args
+                    and isinstance(n.args[0], ast.Constant)):
+                for kw in n.keywords:
+                    if kw.arg == "type":
+                        types_[n.args[0].value] = getattr(kw.value, "id", None)
+        wrong = {f: types_.get(f) for f, t in want.items() if types_.get(f) != t}
+        refuses = "refuse_proxy_with_cdp_endpoint" in {
+            getattr(n.func, "id", None) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        if wrong or not refuses:
+            print(f"       {name}: flag types {wrong}, proxy+cdp refusal called: {refuses}")
+            ok = False
+    import contextlib
+    import io
+    parser = argparse.ArgumentParser(prog="probe")
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            ec.refuse_proxy_with_cdp_endpoint(parser, argparse.Namespace(
+                cdp_endpoint="ws://x.invalid", proxy="http://h.invalid:1", proxy_file=None))
+        ok = False
+    except SystemExit as e:
+        ok &= e.code == 2
+    return check("negative --retries/--delay, zero --pages/--concurrency rejected (exit 2) in "
+                 "every engine; --proxy with --cdp-endpoint refused", ok)
+
+
+def check_scraper_api_page_verdicts() -> bool:
+    """The Scraper API path used to report exit 5 for a served empty page
+    and for a Cloudflare challenge alike; it now uses classify_page()."""
+    import types as _types
+    import scraper_api_client as sac
+    import output_writer as ow
+    tiles = "".join(f'<a class="zimmo-code" href="/nl/x/{i}/">Z{i}</a>' for i in range(6))
+    cases = [
+        ("served, no listings", 200, "<html><body><p>Geen resultaten</p></body></html>",
+         ow.EXIT_ZERO_PRODUCTS),
+        ("Cloudflare challenge", 403, SAMPLE_CLOUDFLARE_HTML, ow.EXIT_BLOCKED),
+        ("grid rendered, parser read nothing", 200, f"<html><body>{tiles}</body></html>",
+         ow.EXIT_FETCH_FAILED),
+        ("real tiles", 200, LIVE_ANGULAR_TILES_HTML, ow.EXIT_OK),
+    ]
+    real_post = sac.requests.post
+    ok = True
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            for label, status, body, want in cases:
+                sac.requests.post = lambda *a, _s=status, _b=body, **k: _types.SimpleNamespace(
+                    status_code=200, headers={}, text="", json=lambda: {"http_code": _s, "body": _b})
+                args = _types.SimpleNamespace(
+                    url="https://www.zimmo.be/nl/gent-9000/te-koop/", twocaptcha_key="stub",
+                    wait_for_text="€", timeout=30, cdp_url=None, proxy=None, category=None,
+                    out=os.path.join(tmp, "api"), format="json", allow_empty=False, dump_html=False)
+                got = sac.scrape(args)
+                if got != want:
+                    print(f"       Scraper API, {label}: exit {got}, expected {want}")
+                    ok = False
+    finally:
+        sac.requests.post = real_post
+    return check("Scraper API path: empty 4, challenge 3, parser failure 5, rows 0", ok)
+
+
+def check_no_private_citations() -> bool:
+    """Public files must state their reasons in their own words, not cite
+    the maintainers' private instruction files or their section numbers.
+    The tokens are assembled from pieces so this file does not match
+    itself."""
+    import re as _re
+    import subprocess
+    banned = _re.compile("|".join([
+        _re.escape("CLAUDE" + ".md"), "claude" + "_2scraper", "2scraper" + "_repo_rules",
+        "codex" + r"\.md", "play" + r"book\s*§", "temp" + r"late\s*§", "§" + r"\s*\d",
+    ]), _re.IGNORECASE)
+    try:
+        files = subprocess.run(["git", "-C", _HERE, "ls-files", "-z"], capture_output=True,
+                               check=True).stdout.decode().split("\0")
+    except (OSError, subprocess.CalledProcessError):
+        files = [os.path.relpath(os.path.join(d, f), _HERE)
+                 for d, dn, fn in os.walk(_HERE) for f in fn if ".git" not in d]
+    hits = []
+    for rel in filter(None, files):
+        path = os.path.join(_HERE, rel)
+        if not os.path.isfile(path):
+            continue
+        try:
+            text = open(path, encoding="utf-8").read()
+        except (UnicodeDecodeError, OSError):
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if banned.search(line):
+                hits.append(f"{rel}:{i}")
+    if hits:
+        print("       " + ", ".join(hits[:10]))
+    return check(f"no public file cites the private maintainer instructions ({len(hits)} found)",
+                 not hits)
+
+
+def check_docker_copy_list_matches_import_graph() -> bool:
+    """The Dockerfile copies an explicit module list; it must be exactly
+    playwright_scraper.py's local import closure."""
+    import re as _re
+    dockerfile = os.path.join(_HERE, "Dockerfile")
+    if not os.path.isfile(dockerfile):
+        return check("Docker COPY list (no Dockerfile here: skipped)", True)
+    text = open(dockerfile, encoding="utf-8").read()
+    copy = _re.search(r"^COPY (env_config\.py.*?) \./\s*$", text, _re.MULTILINE | _re.DOTALL)
+    listed = set(_re.findall(r"[\w]+\.py", copy.group(1))) if copy else set()
+    local = {f[:-3] for f in os.listdir(_HERE) if f.endswith(".py")}
+    need, todo = set(), ["playwright_scraper"]
+    while todo:
+        mod = todo.pop()
+        if mod in need:
+            continue
+        need.add(mod)
+        for n in ast.walk(ast.parse(open(os.path.join(_HERE, mod + ".py"), encoding="utf-8").read())):
+            names = ([a.name for a in n.names] if isinstance(n, ast.Import)
+                     else [n.module] if isinstance(n, ast.ImportFrom) and n.module else [])
+            todo += [x.split(".")[0] for x in names if x.split(".")[0] in local]
+    return check("Dockerfile COPY list equals playwright_scraper.py's local import closure",
+                 listed == {m + ".py" for m in need})
+
+
+def check_credential_scan_reads_json_fixtures() -> bool:
+    """A force-tracked fixture.json holding a key was never opened (only
+    .py/.md/... were scanned), and a scan that read nothing said clean."""
+    import subprocess
+    from check_no_credentials import scan
+    fake_key = "".join("0123456789abcdef"[(i * 5) % 16] for i in range(32))
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            subprocess.run(["git", "-C", tmp, "init", "-q"], check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError):
+            return check("credential scan of .json (git unavailable: skipped)", True)
+        open(os.path.join(tmp, "fixture.json"), "w").write('{"apiKey": "%s"}\n' % fake_key)
+        os.makedirs(os.path.join(tmp, "anyname"))
+        open(os.path.join(tmp, "anyname", "pyvenv.cfg"), "w").write("home = /usr\n")
+        open(os.path.join(tmp, "anyname", "x.py"), "w").write(f"K = '{fake_key}'\n")
+        stats = {}
+        findings = scan(tmp, stats)
+        empty_stats = {}
+        os.makedirs(os.path.join(tmp, "empty"))
+        scan(os.path.join(tmp, "empty"), empty_stats)
+    return check("credential scan opens .json fixtures, skips a venv by pyvenv.cfg, counts files",
+                 [os.path.basename(f[0]) for f in findings] == ["fixture.json"]
+                 and stats.get("scanned") == 1 and empty_stats.get("scanned") == 0)
+
+
+
 if __name__ == "__main__":
     classify_ok = check_classify_page_contract()
     engines_classify_ok = check_engines_use_shared_page_classification()
@@ -1416,7 +1786,18 @@ if __name__ == "__main__":
     unattempted_ok = check_unattempted_pages_prevent_false_complete()
     no_sku_dedup_ok = check_no_sku_rows_participate_in_dedup()
     schema_ok = check_output_schema_and_removed_columns()
-    canary_gate_ok = check_canary_is_skipped_not_green_without_a_proxy()
+    canary_gate_ok = check_canary_fails_without_a_proxy()
+    audit_2026_10_14_ok = all([
+        check_atomic_writes_keep_old_output_and_modes(),
+        check_csv_formula_cells_escaped(),
+        check_solve_budget_one_purchase_per_page(),
+        check_parser_failure_is_not_an_empty_search(),
+        check_numeric_flags_rejected_when_negative(),
+        check_scraper_api_page_verdicts(),
+        check_no_private_citations(),
+        check_docker_copy_list_matches_import_graph(),
+        check_credential_scan_reads_json_fixtures(),
+    ])
     exit_code = main()
     overall_ok = (wording_ok and env_ok and env_roundtrip_ok and credentials_ok
                   and engine_import_ok and ast_ok and flags_ok and signatures_ok
@@ -1424,6 +1805,6 @@ if __name__ == "__main__":
                   and price_no_swallow_ok and pagination_param_ok
                   and epc_regression_ok and css_fallback_scope_ok and live_tiles_ok and item_link_selector_ok
                   and unattempted_ok and no_sku_dedup_ok and audit_2026_10_07_ok
-                  and schema_ok and canary_gate_ok
+                  and schema_ok and canary_gate_ok and audit_2026_10_14_ok
                   and exit_code == 0)
     sys.exit(0 if overall_ok else 1)

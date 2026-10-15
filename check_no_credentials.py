@@ -3,10 +3,8 @@
 check_no_credentials.py
 -----------------------------
 ONE implementation of "no committed credential", invoked from BOTH
-tests.yml and the offline test suite (CLAUDE.md §16 -- "one
-implementation, invoked from both CI and the offline suite, and a check
-asserting that the workflow calls the script rather than reimplementing
-it"). An earlier version of this exact check existed only as an inline
+tests.yml and the offline test suite, with a check asserting that the
+workflow calls the script rather than reimplementing it. An earlier version of this exact check existed only as an inline
 `git grep` in tests.yml -- a second, independent copy of the same
 pattern in a different location is exactly the "two sources of truth"
 trap this family found in three sibling repos at once: one copy matched
@@ -41,7 +39,7 @@ import sys
 from typing import List, Tuple
 
 _ALLOWLISTED_SUBSTRINGS = ("sample_output",)
-# FIXED (external audit, 2026-09-14, codex.md finding #10): the
+# FIXED (external audit, 2026-09-14, finding #10): the
 # previous allowlist exempted ANY path containing "test_" or "/tests/"
 # entirely -- confirmed live during audit to make a real secret
 # committed as e.g. "test_secret.py" invisible to this scanner. This
@@ -81,18 +79,36 @@ def _looks_like_real_credential(matched_text: str) -> bool:
     after_scheme = matched_text.split("://", 1)[-1]
     creds = after_scheme.rstrip("@")
     if "{" in creds or "}" in creds:
-        return False  # a vendor's own braced placeholder, per CLAUDE.md §17
+        return False  # a vendor's own braced placeholder ({login})
     parts = re.split(r"[:\-]", creds.lower())
     if any(part in _PLACEHOLDER_WORDS for part in parts):
         return False
     return True
 
-_SCAN_EXTENSIONS = (".py", ".md", ".yml", ".yaml", ".toml", ".txt", ".env.example")
+# .json/.csv/.html/.cfg too: a fixture or capture that holds an API key in
+# a JSON field ({"apiKey": "..."}) is as committable as a .py file, and
+# until 2026-10-14 a force-tracked fixture.json was never opened.
+_SCAN_EXTENSIONS = (".py", ".md", ".yml", ".yaml", ".toml", ".txt", ".env.example",
+                    ".json", ".csv", ".html", ".cfg")
 _SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv"}
 
 
 def _is_candidate(filename: str) -> bool:
     return filename.endswith(_SCAN_EXTENSIONS) or filename in (".env.example", ".env")
+
+
+def _venv_roots(root: str, rel_paths) -> set:
+    """Relative directories under `root` that are Python virtualenvs,
+    recognised by their pyvenv.cfg rather than by a directory name (a venv
+    can be called anything)."""
+    roots = set()
+    for rel in rel_paths:
+        parts = rel.split("/")
+        for i in range(1, len(parts)):
+            prefix = "/".join(parts[:i])
+            if prefix not in roots and os.path.isfile(os.path.join(root, prefix, "pyvenv.cfg")):
+                roots.add(prefix)
+    return roots
 
 
 def _git_committable_files(root: str):
@@ -105,7 +121,10 @@ def _git_committable_files(root: str):
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-    return [os.path.join(root, rel) for rel in out.decode("utf-8", "replace").split("\0") if rel]
+    rels = [rel for rel in out.decode("utf-8", "replace").split("\0") if rel]
+    venvs = _venv_roots(root, rels)
+    return [os.path.join(root, rel) for rel in rels
+            if not any(rel == v or rel.startswith(v + "/") for v in venvs)]
 
 
 def _iter_files(root: str):
@@ -119,9 +138,10 @@ def _iter_files(root: str):
     # can be committed, and a real `.env` is the user's own configuration,
     # so it is never opened.
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS
+                       and not os.path.isfile(os.path.join(dirpath, d, "pyvenv.cfg"))]
         for filename in filenames:
-            # FIXED (external audit, 2026-09-14, codex.md finding #10):
+            # FIXED (external audit, 2026-09-14, finding #10):
             # `.env` has no extension this glob would ever match, and
             # only the LITERAL example file was special-cased -- a real
             # `.env` accidentally committed (a .gitignore miss, a
@@ -132,8 +152,12 @@ def _iter_files(root: str):
                 yield os.path.join(dirpath, filename)
 
 
-def _is_allowlisted(path: str) -> bool:
-    return any(marker in path for marker in _ALLOWLISTED_SUBSTRINGS)
+def _is_allowlisted(path: str, root: str) -> bool:
+    """Judged on the path RELATIVE to the scanned root, by file name: a
+    clone that happens to live under a directory called `sample_output...`
+    must not exempt every file in it."""
+    name = os.path.basename(os.path.relpath(path, root))
+    return any(name.startswith(marker) for marker in _ALLOWLISTED_SUBSTRINGS)
 
 
 def describe_match(matched_text: str) -> str:
@@ -145,17 +169,21 @@ def describe_match(matched_text: str) -> str:
     return f"{len(matched_text)}-char hex key"
 
 
-def scan(root: str) -> List[Tuple[str, int, str]]:
+def scan(root: str, stats: dict = None) -> List[Tuple[str, int, str]]:
     """Returns a list of (path, line_number, description) findings. The
-    description never contains the matched text (see describe_match)."""
+    description never contains the matched text (see describe_match).
+    `stats["scanned"]`, when a dict is passed, receives the number of files
+    actually read."""
     findings = []
     this_file = os.path.abspath(__file__)
+    scanned = 0
 
     for path in _iter_files(root):
         if os.path.abspath(path) == this_file:
             continue
-        if _is_allowlisted(path):
+        if _is_allowlisted(path, root):
             continue
+        scanned += 1
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
@@ -172,6 +200,8 @@ def scan(root: str) -> List[Tuple[str, int, str]]:
                     continue
                 findings.append((path, line_num, describe_match(match.group())))
 
+    if stats is not None:
+        stats["scanned"] = scanned
     return findings
 
 
@@ -180,7 +210,13 @@ def main() -> int:
     p.add_argument("--path", default=".", help="Root directory to scan (default: current directory)")
     args = p.parse_args()
 
-    findings = scan(args.path)
+    stats = {}
+    findings = scan(args.path, stats)
+    if not stats.get("scanned"):
+        # A scan that read nothing proves nothing: a wrong --path or an
+        # exclusion that swallowed the tree must not report "clean".
+        print(f"Scanned 0 files under {args.path!r} -- refusing to report the tree clean.")
+        return 1
     if findings:
         print(f"Possible committed credential(s) found ({len(findings)}):")
         for path, line_num, text in findings:
@@ -190,7 +226,7 @@ def main() -> int:
               "in this file -- the one place that list lives.")
         return 1
 
-    print(f"No committed credentials found (scanned under {args.path!r}).")
+    print(f"No committed credentials found ({stats['scanned']} files scanned under {args.path!r}).")
     return 0
 
 

@@ -126,9 +126,10 @@ ZIMMO_CDP_ENDPOINT=ws://{login}-zone-scraping_browser-country-be-pid-{profileId}
 python3 playwright_scraper.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/" --pages 3
 ```
 
-A profile's credentials expire (about a day in this family's
-experience): an HTTP 401 `deny_no_user` on connect means a stale profile,
-not a broken scraper, and the run reports it as exit 5.
+A profile's credentials can stop being valid (no fixed lifetime is
+promised here): an HTTP 401 `deny_no_user` on connect usually means the
+endpoint's credentials are no longer accepted, not a broken scraper, and
+the run reports it as exit 5. Check the endpoint before changing code.
 
 Reuse the same `pid` across runs rather than minting a new one each time
 — the Scraping Browser API caps live connections per profile, and a
@@ -156,9 +157,9 @@ python3 scraper_api_client.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/"
 |---|---|---|
 | `--url` | — (or `ZIMMO_URL`) | A zimmo.be search-results URL |
 | `--category` | none | Label written into every row |
-| `--pages` | 1 | Number of result pages |
+| `--pages` | 1 | Number of result pages (1 or more) |
 | `--delay` | 0.0s | Sleep this long after each successfully-fetched page (rate limiting) |
-| `--retries` / `--retry-delay` | 2 / 3.0s | Per-page retry budget |
+| `--retries` / `--retry-delay` | 2 / 3.0s | Extra attempts per page (0 = one attempt; negative values are refused) and the wait between them |
 | `--concurrency` | 1 | Parallel workers for pages 2+ (page 1 always fetched alone; refused together with `--cdp-endpoint`) |
 | `--format` | both | `json`, `csv`, or `both` |
 | `--out` | `zimmo_listings` | Output file prefix |
@@ -168,7 +169,7 @@ python3 scraper_api_client.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/"
 | `--twocaptcha-key` | none (or `TWOCAPTCHA_KEY`) | Needed only if Cloudflare/reCAPTCHA actually appears |
 | `--solve-captcha` | `when-blocked` | `always` solves on every detection; `when-blocked` only when the page has no usable content yet; `never` detects but never solves |
 | `--min-score` | solver default (0.7) | Minimum reCAPTCHA v3 score to request |
-| `--cdp-endpoint` | none (or `ZIMMO_CDP_ENDPOINT`) | Connect to an existing browser instead of launching one |
+| `--cdp-endpoint` | none (or `ZIMMO_CDP_ENDPOINT`) | Connect to an existing browser instead of launching one; refused together with `--proxy`/`--proxy-file`, since that browser uses its own exit |
 | `--allow-empty` | off | Write output even if zero products were found |
 | `--dump-html` | off | Always save a per-page debug `.html`/`.png`, including on success |
 | `--headless` / `--headful` | headless | Toggle a visible browser window |
@@ -231,14 +232,24 @@ does not serve is HTTP 404 ("Pagina niet gevonden"); 429 and 5xx are
 retried up to `--retries` times and then count as failed. A page number
 past the end of a listing is HTTP 200 carrying page 1 again — the run
 recognises that by its data (no new listing) and stops there,
-`complete`. A failed or blocked page lands in `failed_pages`; if it is
-page 1, no later page is requested.
+`complete`. A page whose listing grid rendered but parsed to zero rows is
+a **parser failure** (`parser_failed_pages`), never an empty search. A
+failed, blocked or parser-failed page lands in `failed_pages`; if it is
+page 1, no later page is requested. One page buys at most one paid
+captcha solve, across all its attempts and proxy rotations.
 
 Exit codes, identical across all engines: `0` ok · `1` crash ·
 `2` bad usage · `3` blocked · `4` zero products (no `--allow-empty`) ·
 `5` the content was never obtained (a remote API error, a dead proxy, a
-load timeout, an HTTP error or 404 on page 1) · `6` partial (some pages
-failed or were blocked).
+load timeout, an HTTP error or 404 on page 1, or a rendered page the parser
+read nothing from) · `6` partial (some pages failed, were blocked or
+parsed to nothing). The Scraper API path uses the same page verdicts.
+
+In the CSV, a text cell starting with `=`, `+`, `-`, `@`, a tab, CR or LF
+is prefixed with an apostrophe so a spreadsheet does not run it as a
+formula (`csv_cells_escaped` in the sidecar counts them); the JSON keeps
+every value as served. Files are replaced atomically, so a failed write
+leaves the previous output intact.
 
 Compare two runs: `python3 diff_runs.py --old run1.json --new run2.json`
 — refuses to compare a run whose sidecar isn't `status: complete`, and
@@ -268,17 +279,21 @@ CI runs this offline suite on Python 3.9 and 3.12, an `engine-smoke`
 job that installs each engine into its own clean venv, and a
 `docker-build` job that actually builds the image, runs its entrypoint,
 confirms Chromium launches inside it, and confirms no `.env`/tests/
-fixtures ended up in it. A separate `canary` workflow runs live against
-a real filtered category once a day: 3 pages, headful under xvfb, with
-assertions on the share of rows carrying a price, living area, bedrooms,
-energy grade and property type. It needs a residential exit to pass —
-measured 2026-09-23, GitHub's runner is refused like any datacentre
-address — so it takes one from a `ZIMMO_PROXY` repository secret, and
-without that secret the live job is **skipped** (a `gate` job prints a
-`::notice::` saying why) instead of running a request that is refused
-every time. A skipped run is not a pass: GitHub still draws the badge
-green for a workflow whose only live job was skipped, so open the run
-and check that the `canary` job ran before reading the badge as "tested".
+fixtures ended up in it. The image runs headless by default, and
+zimmo.be refuses headless Chromium: use it with `--cdp-endpoint` (a
+Scraping Browser API session), or supply a display yourself and pass
+`--headful`.
+
+A separate `canary` workflow runs live against a real filtered category
+once a day: 3 pages, headful under xvfb, with assertions on the share of
+rows carrying a price, living area, bedrooms, energy grade and property
+type. It needs a residential exit — measured 2026-09-23 and 2026-10-13,
+GitHub's runner is refused like any datacentre address, and a US
+residential exit was refused while Belgian and German ones were served —
+so it takes one from the `ZIMMO_PROXY` repository secret. Without that
+secret (or with an empty one) the canary **fails** with an error naming
+it: a run that never reached the site is not reported as a pass, and
+neither is a block (exit 3), zero rows, or a parser failure (exit 5).
 Besides the share of populated columns it asserts the arithmetic of the
 data: every row has a unique `sku`, prices fall in a plausible range, no
 `original_price` sits at or below its `price`, and every URL is on
@@ -294,7 +309,7 @@ renamed or removed, and the CHANGELOG says so.
 
 ## Repo maintenance notes (not shipped behaviour)
 
-- A per-clone local `CLAUDE.md`, if you keep one, belongs in
+- Private per-clone notes, if you keep any, belong in
   `.git/info/exclude`, not `.gitignore`.
 - Before making this repo public, scan every blob that ever existed
   (`git rev-list --objects --all`) for credentials, not just the

@@ -6,11 +6,11 @@ zimmo-scraper — Puppeteer edition (via pyppeteer)
 Same feature set as playwright_scraper.py -- see its module docstring
 for the full strategy, pagination, and captcha-handling story. All
 three engines in this family must agree on exit codes, run status, and
-whether a run crashes or spends money (CLAUDE.md §6); this file mirrors
+whether a run crashes or spends money; this file mirrors
 playwright_scraper.py's control flow deliberately, translated into
 pyppeteer's async API.
 
-pyppeteer is effectively unmaintained (CLAUDE.md §6) -- kept for
+pyppeteer is effectively unmaintained -- kept for
 parity, demoted in priority, not in correctness.
 
 Usage
@@ -35,16 +35,19 @@ from pyppeteer import launch, connect
 
 from captcha_solver import (
     detect_recaptcha_v3, solve_recaptcha_v3, detect_cloudflare_challenge,
-    detect_turnstile_challenge, solve_turnstile,
+    detect_turnstile_challenge, solve_turnstile, SolveBudget,
     INJECT_TOKEN_JS, INJECT_TURNSTILE_TOKEN_JS,
 )
 from product_parser import parse_products, SELECTORS
 from output_writer import (
     Product, finish_run, dedupe_by_sku, EXIT_CRASH,
     classify_page, page_outcome_is_ok, should_retry_page, status_rules_out_listings,
-    PAGE_CONTENT, PAGE_BLOCKED,
+    PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, split_page_result,
 )
-from env_config import apply_env_defaults
+from env_config import (
+    apply_env_defaults, non_negative_int, positive_int, non_negative_float,
+    refuse_proxy_with_cdp_endpoint,
+)
 from proxy_pool import (
     ProxyPool, load_proxy_file, is_proxy_error,
     warn_if_concurrency_without_pool, refuse_concurrency_with_cdp_endpoint,
@@ -62,7 +65,7 @@ MIN_CARD_MATCHES = 5
 # their own, and opens its websocket with pings disabled, so a remote
 # browser that stops answering left the run hanging -- measured: page 1
 # done, then the connect for page 2 still waiting after ten minutes.
-# Every remote call is bounded (CLAUDE.md §8); a timeout lands in the
+# Every remote call is bounded; a timeout lands in the
 # ordinary retry path below.
 CDP_CALL_TIMEOUT_S = 60
 
@@ -113,7 +116,7 @@ def _mask_credentials(url: str) -> str:
 def page_url(base_url: str, page_num: int) -> str:
     """See playwright_scraper.py's page_url() -- identical logic,
     duplicated so this engine has no import-time dependency on
-    Playwright being installed (CLAUDE.md §10)."""
+    Playwright being installed."""
     if page_num <= 1:
         return base_url
     parsed = urlparse(base_url)
@@ -123,7 +126,7 @@ def page_url(base_url: str, page_num: int) -> str:
     return urlunparse(parsed._replace(query=new_query))
 
 
-async def handle_captcha_if_present(page, args) -> bool:
+async def handle_captcha_if_present(page, args, budget: SolveBudget) -> bool:
     html = await page.content()
     detected_anything = False
 
@@ -151,7 +154,7 @@ async def handle_captcha_if_present(page, args) -> bool:
             logger.warning("Cloudflare Turnstile challenge detected (sitekey=%s) -- "
                             "attempting to solve.", turnstile.sitekey)
             try:
-                token = solve_turnstile(turnstile, args.twocaptcha_key)
+                token = solve_turnstile(turnstile, args.twocaptcha_key, budget)
                 await page.evaluate(f"({INJECT_TURNSTILE_TOKEN_JS})", token)
                 logger.info("Turnstile token injected. Reloading page to continue.")
                 await asyncio.sleep(1.5)
@@ -172,7 +175,8 @@ async def handle_captcha_if_present(page, args) -> bool:
             logger.warning("reCAPTCHA v3 detected (sitekey=%s, action=%s) -- attempting to solve.",
                            challenge.sitekey, challenge.action)
             try:
-                token = solve_recaptcha_v3(challenge, args.twocaptcha_key, min_score=args.min_score)
+                token = solve_recaptcha_v3(challenge, args.twocaptcha_key, budget,
+                                           min_score=args.min_score)
                 await page.evaluate(f"({INJECT_TOKEN_JS})", token)
                 logger.info("Token injected. Reloading page to continue.")
                 await asyncio.sleep(1.5)
@@ -257,7 +261,7 @@ class CdpConnection:
 
 async def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                        worker_offset: int, cdp: Optional[CdpConnection] = None
-                       ) -> Tuple[List[Product], bool, bool, bool]:
+                       ) -> Tuple[List[Product], bool, bool, bool, bool]:
     """With --cdp-endpoint the page opens in `cdp`, the run's one
     connection; a caller that passes none gets one for this call only."""
     own_cdp = None
@@ -273,6 +277,9 @@ async def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyP
 async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, cdp):
     current_exit = proxy_pool.get_exit_for_worker(worker_offset) if proxy_pool else None
 
+    # One paid-solve allowance for this page, shared by every attempt and
+    # every proxy rotation below (captcha_solver.SolveBudget).
+    budget = SolveBudget()
     for attempt in range(args.retries + 1):
         browser = None
         page = None
@@ -285,7 +292,7 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
                     "args": ["--disable-blink-features=AutomationControlled", "--window-size=1366,900"],
                 }
                 if current_exit:
-                    # Credentials never reach argv (CLAUDE.md §8): only
+                    # Credentials never reach argv: only
                     # the credential-free server string goes on the
                     # launch flag. The credential itself goes through
                     # the DevTools Fetch domain below (_authenticate_proxy).
@@ -303,7 +310,7 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
             response = await page.goto(url, {"waitUntil": "domcontentloaded", "timeout": 60000})
             http_status = response.status if response else None
 
-            detected = await handle_captcha_if_present(page, args)
+            detected = await handle_captcha_if_present(page, args, budget)
             rendered_ok = (False if status_rules_out_listings(http_status)
                            else await _wait_for_listing_markers(page))
 
@@ -350,7 +357,7 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
             if ok and args.delay > 0:
                 await asyncio.sleep(args.delay)
 
-            return products, ok, outcome == PAGE_BLOCKED, False
+            return products, ok, outcome == PAGE_BLOCKED, False, outcome == PAGE_PARSER_FAILED
 
         except Exception as e:
             error_msg = redact_secret_patterns(str(e))
@@ -393,7 +400,7 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
 async def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency: int,
                                      seen_skus_initial=()) -> Tuple[dict, List[int], bool, bool, List[int]]:
     """asyncio equivalent of playwright_scraper.py's own
-    `_fetch_pages_concurrently` -- same contract, same CLAUDE.md §7
+    `_fetch_pages_concurrently` -- same contract, same
     data-based termination, reimplemented as a small worker-pool
     pulling from a shared index under a lock rather than a
     ThreadPoolExecutor, since pyppeteer is async-native."""
@@ -468,14 +475,15 @@ async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
     refuse_concurrency_with_cdp_endpoint(args.concurrency, args.cdp_endpoint)
 
     url_1 = page_url(args.url, 1)
-    products_1, ok_1, blocked_1, remote_1 = await _fetch_page(url_1, 1, args, proxy_pool,
-                                                              worker_offset=0, cdp=cdp)
+    (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
+        await _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0, cdp=cdp))
 
     page_results = {1: products_1}
     failed_pages = [] if ok_1 else [1]
     any_blocked = blocked_1
     any_remote_error = remote_1
     pages_completed = 1 if ok_1 else 0
+    parser_failed_pages: List[int] = [1] if parser_failed_1 else []
     unattempted_pages: List[int] = []
     exhausted_pages: List[int] = []
 
@@ -488,7 +496,11 @@ async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
     if remaining_pages:
         async def fetch_fn(page_num, worker_offset):
             url = page_url(args.url, page_num)
-            return await _fetch_page(url, page_num, args, proxy_pool, worker_offset, cdp=cdp)
+            result, parser_failed = split_page_result(
+                await _fetch_page(url, page_num, args, proxy_pool, worker_offset, cdp=cdp))
+            if parser_failed:
+                parser_failed_pages.append(page_num)
+            return result
 
         initial_skus = {p.sku for p in products_1 if p.sku}
         more_results, more_failed, more_blocked, more_remote, more_unattempted = \
@@ -512,6 +524,7 @@ async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
         remote_api_error=any_remote_error, allow_empty=args.allow_empty,
         started_at=started_at,
         exhausted_pages=exhausted_pages, url=args.url,
+        parser_failed_pages=parser_failed_pages,
     )
 
 
@@ -520,12 +533,13 @@ def parse_args():
     p.add_argument("--url", default=None,
                     help="zimmo.be search-results URL (falls back to ZIMMO_URL from .env)")
     p.add_argument("--category", default=None, help="Label to tag output rows with (optional)")
-    p.add_argument("--pages", type=int, default=1, help="Number of result pages to fetch")
-    p.add_argument("--delay", type=float, default=0.0,
+    p.add_argument("--pages", type=positive_int, default=1, help="Number of result pages to fetch")
+    p.add_argument("--delay", type=non_negative_float, default=0.0,
                     help="Seconds to sleep after each successfully-fetched page (rate limiting)")
-    p.add_argument("--retries", type=int, default=2, help="Retries per page on a transient failure")
-    p.add_argument("--retry-delay", type=float, default=3.0, help="Seconds to wait between retries")
-    p.add_argument("--concurrency", type=int, default=1,
+    p.add_argument("--retries", type=non_negative_int, default=2,
+                    help="Extra attempts per page on a transient failure (0 = one attempt)")
+    p.add_argument("--retry-delay", type=non_negative_float, default=3.0, help="Seconds to wait between retries")
+    p.add_argument("--concurrency", type=positive_int, default=1,
                     help="Parallel workers for pages 2+ (page 1 is always fetched alone). "
                          "Not supported together with --cdp-endpoint.")
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
@@ -539,16 +553,16 @@ def parse_args():
     p.add_argument("--no-proxy-rotate", dest="proxy_rotate", action="store_false",
                     help="Disable proxy rotation -- retry the SAME exit on every failure instead")
     p.add_argument("--proxy-shuffle", action="store_true", help="Shuffle the proxy pool's exit order at startup")
-    p.add_argument("--proxy-block-retries", type=int, default=3,
+    p.add_argument("--proxy-block-retries", type=positive_int, default=3,
                     help="Treat a proxy exit as blocked after this many failures")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
-    p.add_argument("--captcha-api", default=None, help="Alternate captcha-solving API base URL (advanced)")
     p.add_argument("--solve-captcha", choices=["always", "when-blocked", "never"], default="when-blocked")
     p.add_argument("--min-score", type=float, default=None,
                     help="Minimum acceptable reCAPTCHA v3 score to request from the solver")
     p.add_argument("--cdp-endpoint", default=None,
                     help="Connect to an existing browser over CDP instead of launching pyppeteer's "
-                         "bundled Chromium. --proxy and --headless/--headful are ignored when set.")
+                         "bundled Chromium. Refused together with --proxy/--proxy-file (the remote "
+                         "browser has its own exit); --headless/--headful are ignored when set.")
     p.add_argument("--allow-empty", action="store_true",
                     help="Write output even if zero products were found")
     p.add_argument("--dump-html", action="store_true",
@@ -560,6 +574,7 @@ def parse_args():
     apply_env_defaults(args)
     if not args.url:
         p.error("--url is required (or set ZIMMO_URL in .env)")
+    refuse_proxy_with_cdp_endpoint(p, args)
     return args
 
 

@@ -1,5 +1,5 @@
 # Scraper output — large, machine-specific, and stale by the time anyone
-# reads it. Sample files are the one deliberate exception (CLAUDE.md §2).
+# reads it. Sample files are the one deliberate exception.
 *.json
 *.csv
 !sample_output.json
@@ -11,7 +11,7 @@ zimmo_listings.*
 
 # Local diagnostics / live-test working directory — and ANY run directory by
 # kind, not one chosen name (a sibling committed a raw dump through `live/`),
-# plus paged dumps like X.page3 (family template §24, §26).
+# plus paged dumps like X.page3.
 live_results/
 live/
 out/
@@ -69,6 +69,6 @@ secrets*
 
 # Every spelling of a working .env, not just `.env`: a `.env.bak` or
 # `.env.local` is exactly how a live key gets one `git add -A` from a commit
-# (family template §22). The negation keeps the documented example tracked.
+#. The negation keeps the documented example tracked.
 .env*
 !.env.example

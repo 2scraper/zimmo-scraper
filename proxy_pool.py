@@ -4,7 +4,7 @@ proxy_pool.py
 Proxy pool, rotation policy, credential masking, and argv safety. No
 site knowledge.
 
-Two fixes per external audit (2026-09-14, codex.md finding #4):
+Two fixes per external audit (2026-09-14, finding #4):
   1. A failed proxy exit now rotates away IMMEDIATELY on the next
      attempt, rather than staying a candidate until its failure count
      reaches --proxy-block-retries. Previously, with the default of 2

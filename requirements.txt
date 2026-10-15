@@ -2,7 +2,7 @@
 #   pip install -r requirements.txt --break-system-packages
 #
 # Then ONE engine-specific file on top, in its OWN virtualenv if you want
-# more than one installed at once (CLAUDE.md §6): playwright and pyppeteer
+# more than one installed at once: playwright and pyppeteer
 # declare mutually unsatisfiable pins (pyee <12 vs >=13), and pyppeteer
 # and selenium collide on urllib3 (<2.0 vs >=2.6). CI's own engine-smoke
 # job installs each engine into its own fresh venv for exactly this

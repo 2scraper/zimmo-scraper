@@ -5,9 +5,9 @@ zimmo-scraper — Selenium edition
 
 Same feature set as playwright_scraper.py -- see its module docstring
 for the full strategy. All three engines must agree on exit codes, run
-status, and whether a run crashes or spends money (CLAUDE.md §6).
+status, and whether a run crashes or spends money.
 
-TWO CONFIRMED ENGINE LIMITS (CLAUDE.md §6):
+TWO CONFIRMED ENGINE LIMITS:
 
   1. Selenium's `debuggerAddress` was designed for a LOCAL,
      UNAUTHENTICATED debug port. It does NOT forward a `user:pass`
@@ -47,16 +47,19 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from captcha_solver import (
     detect_recaptcha_v3, solve_recaptcha_v3, detect_cloudflare_challenge,
-    detect_turnstile_challenge, solve_turnstile,
+    detect_turnstile_challenge, solve_turnstile, SolveBudget,
     INJECT_TOKEN_JS, INJECT_TURNSTILE_TOKEN_JS,
 )
 from product_parser import parse_products, SELECTORS
 from output_writer import (
     Product, finish_run, dedupe_by_sku, EXIT_CRASH,
     classify_page, page_outcome_is_ok, should_retry_page, status_rules_out_listings,
-    PAGE_CONTENT, PAGE_BLOCKED,
+    PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, split_page_result,
 )
-from env_config import apply_env_defaults
+from env_config import (
+    apply_env_defaults, non_negative_int, positive_int, non_negative_float,
+    refuse_proxy_with_cdp_endpoint,
+)
 from proxy_pool import (
     ProxyPool, load_proxy_file, is_proxy_error,
     warn_if_concurrency_without_pool, refuse_concurrency_with_cdp_endpoint,
@@ -117,7 +120,7 @@ def build_driver(args, proxy_server_only: Optional[str] = None) -> webdriver.Chr
         options.add_argument("--headless=new")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--window-size=1366,900")
-    # UA comes from the browser, not a hardcoded literal (CLAUDE.md §8).
+    # UA comes from the browser, not a hardcoded literal.
 
     if proxy_server_only:
         options.add_argument(f"--proxy-server={proxy_server_only}")
@@ -135,10 +138,10 @@ def build_driver(args, proxy_server_only: Optional[str] = None) -> webdriver.Chr
     return driver
 
 
-def handle_captcha_if_present(driver, args) -> bool:
+def handle_captcha_if_present(driver, args, budget: SolveBudget) -> bool:
     """Selenium's execute_script takes a function BODY with an
     explicit call, not Playwright/pyppeteer's `() => expr` convention
-    (CLAUDE.md §1 on why no JavaScript crosses an engine boundary)."""
+    (which is why no JavaScript string crosses an engine boundary)."""
     html = driver.page_source
     detected_anything = False
 
@@ -163,7 +166,7 @@ def handle_captcha_if_present(driver, args) -> bool:
             logger.warning("Cloudflare Turnstile challenge detected (sitekey=%s) -- "
                             "attempting to solve.", turnstile.sitekey)
             try:
-                token = solve_turnstile(turnstile, args.twocaptcha_key)
+                token = solve_turnstile(turnstile, args.twocaptcha_key, budget)
                 driver.execute_script(f"({INJECT_TURNSTILE_TOKEN_JS})(arguments[0]);", token)
                 logger.info("Turnstile token injected. Reloading page to continue.")
                 time.sleep(1.5)
@@ -184,7 +187,8 @@ def handle_captcha_if_present(driver, args) -> bool:
             logger.warning("reCAPTCHA v3 detected (sitekey=%s, action=%s) -- attempting to solve.",
                            challenge.sitekey, challenge.action)
             try:
-                token = solve_recaptcha_v3(challenge, args.twocaptcha_key, min_score=args.min_score)
+                token = solve_recaptcha_v3(challenge, args.twocaptcha_key, budget,
+                                           min_score=args.min_score)
                 driver.execute_script(f"({INJECT_TOKEN_JS})(arguments[0]);", token)
                 logger.info("Token injected. Reloading page to continue.")
                 time.sleep(1.5)
@@ -225,15 +229,18 @@ def _navigation_status(driver) -> Optional[int]:
 
 
 def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
-                 worker_offset: int) -> Tuple[List[Product], bool, bool, bool]:
+                 worker_offset: int) -> Tuple[List[Product], bool, bool, bool, bool]:
     current_exit = proxy_pool.get_exit_for_worker(worker_offset) if proxy_pool else None
 
+    # One paid-solve allowance for this page, shared by every attempt and
+    # every proxy rotation below (captcha_solver.SolveBudget).
+    budget = SolveBudget()
     for attempt in range(args.retries + 1):
         driver = None
         try:
             if current_exit and current_exit.auth_tuple():
                 # Selenium's --proxy-server cannot authenticate at all
-                # (CLAUDE.md §6) -- strip the credential and warn.
+                # -- strip the credential and warn.
                 logger.warning("Proxy exit %s has credentials, but Selenium's --proxy-server "
                                 "cannot authenticate at all -- connecting WITHOUT credentials, "
                                 "which will likely fail against an authenticated proxy. Use "
@@ -264,7 +271,7 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                 return [], False, False, False
 
             http_status = _navigation_status(driver)
-            detected = handle_captcha_if_present(driver, args)
+            detected = handle_captcha_if_present(driver, args, budget)
             rendered_ok = (False if status_rules_out_listings(http_status)
                            else _wait_for_listing_markers(driver))
 
@@ -311,7 +318,7 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
             if ok and args.delay > 0:
                 time.sleep(args.delay)
 
-            return products, ok, outcome == PAGE_BLOCKED, False
+            return products, ok, outcome == PAGE_BLOCKED, False, outcome == PAGE_PARSER_FAILED
 
         except Exception as e:
             error_msg = redact_secret_patterns(str(e))
@@ -413,13 +420,15 @@ def scrape(args) -> int:
     refuse_concurrency_with_cdp_endpoint(args.concurrency, args.cdp_endpoint)
 
     url_1 = page_url(args.url, 1)
-    products_1, ok_1, blocked_1, remote_1 = _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0)
+    (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
+        _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0))
 
     page_results = {1: products_1}
     failed_pages = [] if ok_1 else [1]
     any_blocked = blocked_1
     any_remote_error = remote_1
     pages_completed = 1 if ok_1 else 0
+    parser_failed_pages: List[int] = [1] if parser_failed_1 else []
     unattempted_pages: List[int] = []
     exhausted_pages: List[int] = []
 
@@ -432,7 +441,11 @@ def scrape(args) -> int:
     if remaining_pages:
         def fetch_fn(page_num, worker_offset):
             url = page_url(args.url, page_num)
-            return _fetch_page(url, page_num, args, proxy_pool, worker_offset)
+            result, parser_failed = split_page_result(
+                _fetch_page(url, page_num, args, proxy_pool, worker_offset))
+            if parser_failed:
+                parser_failed_pages.append(page_num)
+            return result
 
         initial_skus = {p.sku for p in products_1 if p.sku}
         more_results, more_failed, more_blocked, more_remote, more_unattempted = \
@@ -456,6 +469,7 @@ def scrape(args) -> int:
         remote_api_error=any_remote_error, allow_empty=args.allow_empty,
         started_at=started_at,
         exhausted_pages=exhausted_pages, url=args.url,
+        parser_failed_pages=parser_failed_pages,
     )
 
 
@@ -464,29 +478,29 @@ def parse_args():
     p.add_argument("--url", default=None,
                     help="zimmo.be search-results URL (falls back to ZIMMO_URL from .env)")
     p.add_argument("--category", default=None, help="Label to tag output rows with (optional)")
-    p.add_argument("--pages", type=int, default=1, help="Number of result pages to fetch")
-    p.add_argument("--delay", type=float, default=0.0,
+    p.add_argument("--pages", type=positive_int, default=1, help="Number of result pages to fetch")
+    p.add_argument("--delay", type=non_negative_float, default=0.0,
                     help="Seconds to sleep after each successfully-fetched page (rate limiting)")
-    p.add_argument("--retries", type=int, default=2, help="Retries per page on a transient failure")
-    p.add_argument("--retry-delay", type=float, default=3.0, help="Seconds to wait between retries")
-    p.add_argument("--concurrency", type=int, default=1,
+    p.add_argument("--retries", type=non_negative_int, default=2,
+                    help="Extra attempts per page on a transient failure (0 = one attempt)")
+    p.add_argument("--retry-delay", type=non_negative_float, default=3.0, help="Seconds to wait between retries")
+    p.add_argument("--concurrency", type=positive_int, default=1,
                     help="Parallel workers for pages 2+ (page 1 is always fetched alone). "
                          "Not supported together with --cdp-endpoint.")
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
     p.add_argument("--out", default="zimmo_listings", help="Output file prefix")
     p.add_argument("--proxy", default=None,
                     help="Proxy URL. Credentials, if present, are STRIPPED with a warning -- "
-                         "Selenium's --proxy-server cannot authenticate at all (CLAUDE.md §6).")
+                         "Selenium's --proxy-server cannot authenticate at all.")
     p.add_argument("--proxy-file", default=None, help="Path to a file of proxy URLs, one per line")
     p.add_argument("--proxy-rotate", action="store_true", default=True,
                     help="Rotate to a different pool exit on a dead-proxy error (default: on)")
     p.add_argument("--no-proxy-rotate", dest="proxy_rotate", action="store_false",
                     help="Disable proxy rotation -- retry the SAME exit on every failure instead")
     p.add_argument("--proxy-shuffle", action="store_true", help="Shuffle the proxy pool's exit order at startup")
-    p.add_argument("--proxy-block-retries", type=int, default=3,
+    p.add_argument("--proxy-block-retries", type=positive_int, default=3,
                     help="Treat a proxy exit as blocked after this many failures")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
-    p.add_argument("--captcha-api", default=None, help="Alternate captcha-solving API base URL (advanced)")
     p.add_argument("--solve-captcha", choices=["always", "when-blocked", "never"], default="when-blocked")
     p.add_argument("--min-score", type=float, default=None,
                     help="Minimum acceptable reCAPTCHA v3 score to request from the solver")
@@ -505,6 +519,7 @@ def parse_args():
     apply_env_defaults(args)
     if not args.url:
         p.error("--url is required (or set ZIMMO_URL in .env)")
+    refuse_proxy_with_cdp_endpoint(p, args)
     return args
 
 
