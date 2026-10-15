@@ -9,6 +9,16 @@ here rather than treated as a violation of the format.
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-10-15
+
+> **Major version for a schema break.** 2.0.0 is the same code as 1.3.0,
+> re-released under a major version. 1.3.0 removed the `rating`,
+> `review_count` and `in_stock` output columns (and the unused
+> `--captcha-api` flag), which breaks the row schema that 1.0.0 declared a
+> public interface; such a change belongs in a major version. Anyone
+> pinned to 1.x should stay on 1.2.1 or adapt to the new row; see 1.3.0
+> below for the full list of changes.
+
 ## [1.3.0] — 2026-10-15
 
 > **Exit codes.** A page whose listing grid rendered but parsed to zero
