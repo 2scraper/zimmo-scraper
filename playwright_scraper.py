@@ -54,16 +54,19 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 from captcha_solver import (
     detect_recaptcha_v3, solve_recaptcha_v3, detect_cloudflare_challenge,
-    detect_turnstile_challenge, solve_turnstile,
+    detect_turnstile_challenge, solve_turnstile, SolveBudget,
     INJECT_TOKEN_JS, INJECT_TURNSTILE_TOKEN_JS,
 )
 from product_parser import parse_products, SELECTORS
 from output_writer import (
     Product, finish_run, dedupe_by_sku, EXIT_CRASH,
     classify_page, page_outcome_is_ok, should_retry_page, status_rules_out_listings,
-    PAGE_CONTENT, PAGE_BLOCKED,
+    PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, split_page_result,
 )
-from env_config import apply_env_defaults
+from env_config import (
+    apply_env_defaults, non_negative_int, positive_int, non_negative_float,
+    refuse_proxy_with_cdp_endpoint,
+)
 from proxy_pool import (
     ProxyPool, load_proxy_file, is_proxy_error,
     warn_if_concurrency_without_pool, refuse_concurrency_with_cdp_endpoint,
@@ -103,12 +106,12 @@ def page_url(base_url: str, page_num: int) -> str:
     return urlunparse(parsed._replace(query=new_query))
 
 
-def handle_captcha_if_present(page, args) -> bool:
+def handle_captcha_if_present(page, args, budget: SolveBudget) -> bool:
     """Runs after EVERY navigation. Returns True if a challenge was
     detected (regardless of whether solving was attempted or
     succeeded).
 
-    FIXED (external audit, 2026-09-14, codex.md finding #3):
+    FIXED (external audit, 2026-09-14, finding #3):
     --solve-captcha=never previously did not prevent the solver from
     being called at all -- detection and solving were unconditional.
     Now: "never" detects (for logging/blocked-status) but never calls a
@@ -147,7 +150,7 @@ def handle_captcha_if_present(page, args) -> bool:
             logger.warning("Cloudflare Turnstile challenge detected (sitekey=%s) -- "
                             "attempting to solve.", turnstile.sitekey)
             try:
-                token = solve_turnstile(turnstile, args.twocaptcha_key)
+                token = solve_turnstile(turnstile, args.twocaptcha_key, budget)
                 page.evaluate(INJECT_TURNSTILE_TOKEN_JS, token)
                 logger.info("Turnstile token injected. Reloading page to continue.")
                 page.wait_for_timeout(1500)
@@ -168,7 +171,8 @@ def handle_captcha_if_present(page, args) -> bool:
             logger.warning("reCAPTCHA v3 detected (sitekey=%s, action=%s) -- attempting to solve.",
                            challenge.sitekey, challenge.action)
             try:
-                token = solve_recaptcha_v3(challenge, args.twocaptcha_key, min_score=args.min_score)
+                token = solve_recaptcha_v3(challenge, args.twocaptcha_key, budget,
+                                           min_score=args.min_score)
                 page.evaluate(INJECT_TOKEN_JS, token)
                 logger.info("Token injected. Reloading page to continue.")
                 page.wait_for_timeout(1500)
@@ -273,11 +277,12 @@ class CdpConnection:
 
 def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                  worker_offset: int, cdp: Optional[CdpConnection] = None
-                 ) -> Tuple[List[Product], bool, bool, bool]:
+                 ) -> Tuple[List[Product], bool, bool, bool, bool]:
     """Fetch and parse one page. Returns
-    (products, success, blocked, remote_api_error).
+    (products, success, blocked, remote_api_error, parser_failed); a
+    failure path returns the first four only.
 
-    CRITICAL FIX (external audit, 2026-09-14, codex.md finding #1): this
+    CRITICAL FIX (external audit, 2026-09-14, finding #1): this
     function now creates and tears down its OWN `sync_playwright()`
     context internally, rather than receiving one shared object created
     in a different thread. The previous version created a single
@@ -312,6 +317,9 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
 
 
 def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, current_exit, cdp):
+    # One paid-solve allowance for this page, shared by every attempt and
+    # every proxy rotation below (captcha_solver.SolveBudget).
+    budget = SolveBudget()
     for attempt in range(args.retries + 1):
         browser = None
         page = None
@@ -340,7 +348,7 @@ def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, current
                 response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 http_status = response.status if response else None
 
-                detected = handle_captcha_if_present(page, args)
+                detected = handle_captcha_if_present(page, args, budget)
                 rendered_ok = (False if status_rules_out_listings(http_status)
                                else _wait_for_listing_markers(page))
 
@@ -393,7 +401,7 @@ def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, current
                 if ok and args.delay > 0:
                     time.sleep(args.delay)
 
-                return products, ok, outcome == PAGE_BLOCKED, False
+                return products, ok, outcome == PAGE_BLOCKED, False, outcome == PAGE_PARSER_FAILED
 
         except PWTimeout:
             _drop_cdp_after_failure(cdp, page)
@@ -543,14 +551,15 @@ def _scrape(args, cdp: Optional[CdpConnection]) -> int:
     # -- see _fetch_page's own docstring for why every call, including
     # this one in the main thread, manages its own context uniformly).
     url_1 = page_url(args.url, 1)
-    products_1, ok_1, blocked_1, remote_1 = _fetch_page(url_1, 1, args, proxy_pool,
-                                                        worker_offset=0, cdp=cdp)
+    (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
+        _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0, cdp=cdp))
 
     page_results = {1: products_1}
     failed_pages = [] if ok_1 else [1]
     any_blocked = blocked_1
     any_remote_error = remote_1
     pages_completed = 1 if ok_1 else 0
+    parser_failed_pages: List[int] = [1] if parser_failed_1 else []
     unattempted_pages: List[int] = []
     exhausted_pages: List[int] = []
 
@@ -565,7 +574,11 @@ def _scrape(args, cdp: Optional[CdpConnection]) -> int:
     if remaining_pages:
         def fetch_fn(page_num, worker_offset):
             url = page_url(args.url, page_num)
-            return _fetch_page(url, page_num, args, proxy_pool, worker_offset, cdp=cdp)
+            result, parser_failed = split_page_result(
+                _fetch_page(url, page_num, args, proxy_pool, worker_offset, cdp=cdp))
+            if parser_failed:
+                parser_failed_pages.append(page_num)
+            return result
 
         initial_skus = {p.sku for p in products_1 if p.sku}
         more_results, more_failed, more_blocked, more_remote, more_unattempted = \
@@ -588,7 +601,7 @@ def _scrape(args, cdp: Optional[CdpConnection]) -> int:
         all_products, args.out, args.format,
         pages_requested=args.pages, pages_completed=pages_completed,
         failed_pages=failed_pages,
-        # FIXED (external audit, 2026-09-14, codex.md finding #5):
+        # FIXED (external audit, 2026-09-14, finding #5):
         # unattempted_pages was computed but never passed into
         # finish_run() -- a run that stopped at page 1 (blocked) with
         # --pages 5 could report status=complete, exit 0. Now passed
@@ -599,6 +612,7 @@ def _scrape(args, cdp: Optional[CdpConnection]) -> int:
         remote_api_error=any_remote_error, allow_empty=args.allow_empty,
         started_at=started_at,
         exhausted_pages=exhausted_pages, url=args.url,
+        parser_failed_pages=parser_failed_pages,
     )
 
 
@@ -607,12 +621,13 @@ def parse_args():
     p.add_argument("--url", default=None,
                     help="zimmo.be search-results URL (falls back to ZIMMO_URL from .env)")
     p.add_argument("--category", default=None, help="Label to tag output rows with (optional)")
-    p.add_argument("--pages", type=int, default=1, help="Number of result pages to fetch")
-    p.add_argument("--delay", type=float, default=0.0,
+    p.add_argument("--pages", type=positive_int, default=1, help="Number of result pages to fetch")
+    p.add_argument("--delay", type=non_negative_float, default=0.0,
                     help="Seconds to sleep after each successfully-fetched page (rate limiting)")
-    p.add_argument("--retries", type=int, default=2, help="Retries per page on a transient failure")
-    p.add_argument("--retry-delay", type=float, default=3.0, help="Seconds to wait between retries")
-    p.add_argument("--concurrency", type=int, default=1,
+    p.add_argument("--retries", type=non_negative_int, default=2,
+                    help="Extra attempts per page on a transient failure (0 = one attempt)")
+    p.add_argument("--retry-delay", type=non_negative_float, default=3.0, help="Seconds to wait between retries")
+    p.add_argument("--concurrency", type=positive_int, default=1,
                     help="Parallel workers for pages 2+ (page 1 is always fetched alone). "
                          "Not supported together with --cdp-endpoint.")
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
@@ -629,16 +644,16 @@ def parse_args():
                          "defaulting to True, which meant it could never actually be turned off "
                          "from the command line -- this flag is the real, working opt-out.")
     p.add_argument("--proxy-shuffle", action="store_true", help="Shuffle the proxy pool's exit order at startup")
-    p.add_argument("--proxy-block-retries", type=int, default=3,
+    p.add_argument("--proxy-block-retries", type=positive_int, default=3,
                     help="Treat a proxy exit as blocked after this many failures")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
-    p.add_argument("--captcha-api", default=None, help="Alternate captcha-solving API base URL (advanced)")
     p.add_argument("--solve-captcha", choices=["always", "when-blocked", "never"], default="when-blocked")
     p.add_argument("--min-score", type=float, default=None,
                     help="Minimum acceptable reCAPTCHA v3 score to request from the solver")
     p.add_argument("--cdp-endpoint", default=None,
                     help="Connect to an existing browser over CDP instead of launching Playwright's "
-                         "bundled Chromium. --proxy and --headless/--headful are ignored when set.")
+                         "bundled Chromium. Refused together with --proxy/--proxy-file (the remote "
+                         "browser has its own exit); --headless/--headful are ignored when set.")
     p.add_argument("--allow-empty", action="store_true",
                     help="Write output even if zero products were found")
     p.add_argument("--dump-html", action="store_true",
@@ -650,6 +665,7 @@ def parse_args():
     apply_env_defaults(args)
     if not args.url:
         p.error("--url is required (or set ZIMMO_URL in .env)")
+    refuse_proxy_with_cdp_endpoint(p, args)
     return args
 
 

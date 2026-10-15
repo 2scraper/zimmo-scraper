@@ -1,10 +1,16 @@
 name: canary
 
-# One real run daily against a known-good FILTERED CATEGORY URL
-# (CLAUDE.md §11). Requests >=3 pages -- with one page, pagination is
-# never exercised, which is exactly how a silent-single-page bug would
-# survive undetected. Uploads artefacts on every run so a red canary can
-# be diagnosed from the log alone.
+# One real run daily against a known-good search URL, >=3 pages, so
+# pagination is exercised and not only page 1. Artefacts are uploaded on
+# every run, so a red canary can be diagnosed from the run alone.
+#
+# This canary ends green ONLY when the scraper read real listings from
+# zimmo.be. zimmo.be refuses GitHub's datacentre addresses (Cloudflare
+# 403, measured 2026-09-23 and 2026-10-13) and serves only a residential
+# exit (Belgian or German worked; a US exit was refused) with a headful
+# browser, so the run needs the ZIMMO_PROXY repository secret. Without
+# it the job FAILS with an error naming the secret: a skipped or
+# "refused, as expected" run is not a test of the site.
 
 on:
   schedule:
@@ -18,40 +24,22 @@ on:
       - ".github/workflows/canary.yml"
 
 jobs:
-  # `secrets` is not available in a job-level `if`, so presence is tested
-  # here and handed on as an output. The canary job below is then SKIPPED
-  # (shown as skipped, not as a green run) when no ZIMMO_PROXY is set: a
-  # run from the runner's own address is refused by Cloudflare every time
-  # (README, "What you need"), so running it would test nothing and
-  # reporting it as a pass would be a claim nobody measured.
-  gate:
-    runs-on: ubuntu-22.04
-    env:
-      HAS_ZIMMO_PROXY: ${{ secrets.ZIMMO_PROXY != '' }}
-    outputs:
-      has_proxy: ${{ steps.g.outputs.has_proxy }}
-    steps:
-      - id: g
-        run: |
-          echo "has_proxy=$HAS_ZIMMO_PROXY" >> "$GITHUB_OUTPUT"
-          if [ "$HAS_ZIMMO_PROXY" != "true" ]; then
-            echo "::notice::canary SKIPPED, not passed: no ZIMMO_PROXY secret is set, and zimmo.be refuses this runner's address. The site needs a residential exit plus a headful browser (README, 'What you need'). Add a residential proxy as the ZIMMO_PROXY repository secret to make this canary test the scraper daily."
-          fi
-
   canary:
-    needs: gate
-    if: needs.gate.outputs.has_proxy == 'true'
     # jammy, pinned, for the same reason tests.yml's engine-smoke job
     # pins it: playwright==1.44.0 cannot install its system deps on
     # Ubuntu 24.04, and the Dockerfile's base image is v1.44.0-jammy.
     runs-on: ubuntu-22.04
-    # What zimmo.be lets through, measured 2026-09-23 (README, "What you
-    # need"): a residential exit AND a visible (headful) browser. Headless
-    # Chromium is refused even from a Belgian home address, and a
-    # datacentre address is refused either way.
-    env:
-      HAS_ZIMMO_PROXY: "true"
     steps:
+      - name: Require the ZIMMO_PROXY secret
+        env:
+          ZIMMO_PROXY: ${{ secrets.ZIMMO_PROXY }}
+        run: |
+          if [ -z "$ZIMMO_PROXY" ]; then
+            echo "::error::ZIMMO_PROXY is missing or empty, so this canary cannot reach zimmo.be (it refuses GitHub runners' addresses). Set the ZIMMO_PROXY repository secret to a residential proxy URL (credentials, host and port) with a Belgian or German exit. This run tested nothing."
+            exit 1
+          fi
+          echo "[canary] ZIMMO_PROXY is set (value masked)."
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -66,9 +54,8 @@ jobs:
 
       - name: Run against a known-good filtered category, >=3 pages (headful, under xvfb)
         env:
-          # The proxy goes through the ENVIRONMENT, never a command line
-          # (CLAUDE.md §3, §11). An unset secret arrives as an empty
-          # string, which env_config.py treats as unset.
+          # The proxy goes through the ENVIRONMENT, never a command line,
+          # so it cannot appear in the process list or the job log.
           ZIMMO_PROXY: ${{ secrets.ZIMMO_PROXY }}
         run: |
           set +e
@@ -91,7 +78,7 @@ jobs:
 
           code = int(os.environ.get("exit_code", "1"))
           if code != 0:
-              print(f"::error::engine exit code {code} (0 ok, 3 blocked, 4 zero rows, 5 content never obtained, 6 partial)")
+              print(f"::error::engine exit code {code} (0 ok, 3 blocked, 4 zero rows, 5 content never obtained or parser found nothing on a rendered page, 6 partial)")
               sys.exit(1)
 
           meta = json.load(open("canary_run.meta.json"))

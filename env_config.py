@@ -2,7 +2,7 @@
 env_config.py
 -----------------
 Hand-rolled .env loader for zimmo-scraper, per the 2scraper family
-template (CLAUDE.md §3). No new dependency -- defers to python-dotenv
+template. No new dependency -- defers to python-dotenv
 only if the project already has it installed; otherwise parses
 KEY=VALUE lines itself. ~30 lines of actual logic, as prescribed.
 
@@ -20,12 +20,53 @@ without printing any secret's actual value -- this is the first thing to
 check when a key "isn't working".
 """
 
+import argparse
 import os
 from pathlib import Path
 from typing import Dict, Optional
 
+
+# --- Numeric flag types -----------------------------------------------------
+#
+# argparse turns a ValueError/ArgumentTypeError from these into
+# "error: argument --retries: ...", exit 2. --retries counts EXTRA attempts
+# (0 = one navigation, no retry), so 0 is legal there; a negative value
+# used to run zero navigations and report "content never obtained", exit 5.
+
+def non_negative_int(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {value}")
+    return value
+
+
+def positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {value}")
+    return value
+
+
+def non_negative_float(text: str) -> float:
+    value = float(text)
+    if not value >= 0:   # also rejects nan
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {text}")
+    return value
+
+
+def refuse_proxy_with_cdp_endpoint(parser: argparse.ArgumentParser, args) -> None:
+    """A --cdp-endpoint browser is already running with its own exit: a
+    local proxy cannot be applied to it and was silently ignored. Refuse
+    the combination (from flags or .env alike) instead of running without
+    the proxy the caller asked for."""
+    if getattr(args, "cdp_endpoint", None) and (getattr(args, "proxy", None)
+                                                 or getattr(args, "proxy_file", None)):
+        parser.error("--proxy/--proxy-file cannot be combined with --cdp-endpoint: the remote "
+                     "browser uses its own exit (check ZIMMO_PROXY and ZIMMO_CDP_ENDPOINT in "
+                     ".env too)")
+
 # Explicit map: env var name -> argparse destination it fills.
-# CLAUDE.md §3: never map a variable onto a flag that already has a
+# Never map a variable onto a flag that already has a
 # non-empty default (e.g. --out defaults to "zimmo_listings") -- the
 # loader only fills UNSET values, so such a mapping would be silently
 # inert and look configurable when it is not.
@@ -75,7 +116,7 @@ def _load_dotenv_values(dotenv_path: Optional[str] = None) -> Dict[str, str]:
 
 
 def _is_placeholder(value: Optional[str]) -> bool:
-    """CLAUDE.md §17: "a copied .env.example read as CONFIGURED" — the
+    """Guards against a copied .env.example being read as CONFIGURED: the
     two credentialled URLs the vendor documents (the Scraping Browser
     endpoint and the 2Captcha proxy URL) are written with `{login}`,
     `{password}`-style placeholders IN THE VENDOR'S OWN DOCS, and an
@@ -130,8 +171,8 @@ def _mask(value: Optional[str]) -> str:
 if __name__ == "__main__":
     # Diagnostic entry point -- prints WHERE each value came from, never
     # the value itself. Run this first when a key "isn't working". Names
-    # the placeholder reason rather than quoting the value (CLAUDE.md
-    # §17: the value itself can be a credentialled URL).
+    # the placeholder reason rather than quoting the value (the value
+    # itself can be a credentialled URL).
     dotenv_values = _load_dotenv_values()
     print("env_config.py diagnostic — source of each known variable:\n")
     for env_var in ENV_KEYS:

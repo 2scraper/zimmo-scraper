@@ -11,7 +11,7 @@ existed. These tests drive each engine's REAL scrape() and _fetch_page()
 against a fake remote browser that counts connections, so the property is
 pinned without a network or a paid session.
 
-Skipped, not failed, when an engine's driver is not installed (CLAUDE.md §10).
+Skipped, not failed, when an engine's driver is not installed.
 """
 
 import asyncio

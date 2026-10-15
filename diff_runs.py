@@ -3,7 +3,7 @@
 diff_runs.py
 -----------------
 Diff two zimmo-scraper output runs by `sku`. No site knowledge -- shared
-verbatim across the 2scraper family (CLAUDE.md §1, §9).
+verbatim across the 2scraper family.
 
 Refuses to compare two runs unless BOTH sidecars report status
 "complete": a partial run's un-fetched pages would otherwise read as
@@ -198,7 +198,7 @@ def main() -> int:
     if args.fail_on_change and (result["changed_count"] > 0
                                  or result["added_count"] > 0
                                  or result["removed_count"] > 0):
-        # FIXED (external audit, 2026-09-14, codex.md): the help text
+        # FIXED (external audit, 2026-09-14): the help text
         # says "if anything actually changed" -- a listing appearing or
         # disappearing between two runs is exactly that, to anyone
         # reading the flag's own description, even though internally

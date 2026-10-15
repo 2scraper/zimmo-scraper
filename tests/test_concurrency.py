@@ -2,13 +2,13 @@
 tests/test_concurrency.py
 -----------------------------
 Drives playwright_scraper.py's `_fetch_pages_concurrently` directly, with
-a stub `fetch_fn` and no browser at all (CLAUDE.md §10) -- a live run
+a stub `fetch_fn` and no browser at all -- a live run
 cannot always reach this machinery, since page 1 is fetched alone and
 decides whether the rest may be addressed: a blocked page 1 means the
 workers here never start.
 
 Guarded behind try/except ImportError so the offline suite still passes
-with Playwright not installed (CLAUDE.md §10) -- this file specifically
+with Playwright not installed -- this file specifically
 tests playwright_scraper.py's own dispatcher, so it is skipped, not
 failed, when that engine's own dependency is absent.
 """

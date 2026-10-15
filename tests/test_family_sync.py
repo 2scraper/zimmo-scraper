@@ -38,6 +38,6 @@ def test_pyppeteer_never_uses_page_authenticate():
 ])
 def test_gitignore_by_shape(path, ignored):
     """A renamed .env, a run directory and a paged dump are ignored by SHAPE
-    (family template §22-§26); the documented example and the sample are not."""
+   ; the documented example and the sample are not."""
     r = subprocess.run(["git", "check-ignore", "-q", path], cwd=REPO)
     assert (r.returncode == 0) == ignored

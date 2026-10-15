@@ -1,4 +1,4 @@
-# EXACTLY pinned, not >=1.44 (external audit, 2026-09-14, codex.md
+# EXACTLY pinned, not >=1.44 (external audit, 2026-09-14,
 # finding #7): Dockerfile's base image (mcr.microsoft.com/playwright/
 # python:v1.44.0-jammy) bundles a SPECIFIC Chromium revision matched to
 # playwright==1.44.0 exactly. An unpinned `>=1.44` requirement lets pip

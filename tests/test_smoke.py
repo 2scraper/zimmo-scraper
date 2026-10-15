@@ -2,7 +2,7 @@
 tests/test_smoke.py
 -----------------------
 Wraps smoke_test.py as a single pytest test, so `pytest` works as an
-entry point without a second copy of the checks (CLAUDE.md §10:
+entry point without a second copy of the checks:
 smoke_test.py is one file of plain functions with inline fixtures --
 no pytest, no conftest, no fixtures directory of its own; this file is
 the only place pytest-specific glue lives).

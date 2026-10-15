@@ -74,12 +74,20 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
+from typing import Optional, Tuple
 
 import requests
 
-from product_parser import parse_products
-from output_writer import finish_run, dedupe_by_sku, EXIT_REMOTE_API_ERROR
-from env_config import apply_env_defaults
+from bs4 import BeautifulSoup
+
+from captcha_solver import detect_cloudflare_challenge
+from product_parser import parse_products, SELECTORS
+from output_writer import (
+    finish_run, dedupe_by_sku, EXIT_REMOTE_API_ERROR,
+    classify_page, page_outcome_is_ok, status_rules_out_listings,
+    PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED,
+)
+from env_config import apply_env_defaults, positive_int
 from proxy_pool import redact_secret_patterns
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -100,11 +108,15 @@ SCRAPER_API_BASE = "https://scraper.2captcha.com"
 # not expected to appear on a genuine Cloudflare block page at all.
 DEFAULT_WAIT_FOR_TEXT = "€"
 
+# Same threshold as the browser engines' readiness wait.
+MIN_CARD_MATCHES = 5
+
 
 def scrape_via_api(url: str, api_key: str, wait_for_text: str, timeout: int,
-                    cdp_url: str = None, proxy: str = None) -> str:
+                    cdp_url: str = None, proxy: str = None) -> Tuple[str, Optional[int]]:
     """Calls the Scraper API's synchronous /tasks/sync endpoint and
-    returns the fetched page's raw HTML. Raises on any failure.
+    returns (the fetched page's raw HTML, the target's own HTTP status or
+    None). Raises on any failure of the API call itself.
 
     `proxy`: CONFIRMED LIVE 2026-09-16 -- field name and a plain
     `scheme://user:pass@host:port` string value are accepted, AND the
@@ -150,7 +162,7 @@ def scrape_via_api(url: str, api_key: str, wait_for_text: str, timeout: int,
     except requests.RequestException as e:
         # The key rides in a header here, not a query string, so this
         # is lower risk than the family's known leak points -- but
-        # redact globally regardless (CLAUDE.md §8), and a caller-
+        # redact globally regardless, and a caller-
         # supplied --cdp-url IS part of the request body and could in
         # principle surface in a verbose client-side error.
         raise RuntimeError(f"Scraper API request failed: {redact_secret_patterns(str(e))}") from None
@@ -177,21 +189,22 @@ def scrape_via_api(url: str, api_key: str, wait_for_text: str, timeout: int,
     # and the TARGET's HTTP code is `http_code`. Comparing the string
     # `status` with 400 raised TypeError on every successful call.
     target_status = data.get("http_code")
-    if isinstance(target_status, int) and target_status >= 400:
-        logger.warning("Target page itself responded with HTTP %s -- parsing whatever HTML "
-                        "came back anyway.", target_status)
+    if not isinstance(target_status, int):
+        target_status = None
+    elif target_status >= 400:
+        logger.warning("Target page itself responded with HTTP %s.", target_status)
 
     html = data.get("body", "")
     if not html:
         raise RuntimeError(f"Scraper API returned no HTML body. Full response: {resp.text[:500]}")
-    return html
+    return html, target_status
 
 
 def scrape(args) -> int:
     started_at = datetime.now(timezone.utc).isoformat()
 
     try:
-        html = scrape_via_api(args.url, args.twocaptcha_key, args.wait_for_text,
+        html, target_status = scrape_via_api(args.url, args.twocaptcha_key, args.wait_for_text,
                                args.timeout, args.cdp_url, args.proxy)
     except Exception as e:
         logger.error("Scraper API request failed: %s", redact_secret_patterns(str(e)))
@@ -217,12 +230,31 @@ def scrape(args) -> int:
 
     products = dedupe_by_sku(products)
 
+    # The same page verdict as the browser engines (output_writer.
+    # classify_page): a served page with no listings is an empty search
+    # (exit 4), a Cloudflare challenge or a 403 is a block (exit 3), a
+    # rendered listing grid that parses to nothing is a parser failure
+    # (exit 5), and a 5xx/404 means the content was never obtained.
+    # "Rendered" means the HTML holds more than MIN_CARD_MATCHES listing
+    # links, the same test the browser engines wait for.
+    rendered_ok = (not status_rules_out_listings(target_status)
+                   and len(BeautifulSoup(html, "html.parser").select(SELECTORS["item_link"]))
+                   > MIN_CARD_MATCHES)
+    outcome = classify_page(len(products), target_status, detect_cloudflare_challenge(html),
+                            rendered_ok)
+    if outcome != PAGE_CONTENT:
+        logger.warning("Page 1: HTTP %s, classified as %s.", target_status, outcome)
+    ok = page_outcome_is_ok(outcome)
+
     return finish_run(
         products, args.out, args.format,
-        pages_requested=1, pages_completed=1 if products else 0,
-        failed_pages=[] if products else [1],
+        pages_requested=1, pages_completed=1 if ok else 0,
+        failed_pages=[] if ok else [1],
+        blocked=outcome == PAGE_BLOCKED,
+        parser_failed_pages=[1] if outcome == PAGE_PARSER_FAILED else [],
         allow_empty=args.allow_empty,
         started_at=started_at,
+        url=args.url,
     )
 
 
@@ -238,7 +270,7 @@ def parse_args():
                          "and Browser API)")
     p.add_argument("--wait-for-text", default=DEFAULT_WAIT_FOR_TEXT,
                     help="Text that must appear in the page before the Scraper API returns")
-    p.add_argument("--timeout", type=int, default=90,
+    p.add_argument("--timeout", type=positive_int, default=90,
                     help="Max seconds to let the Scraper API's own task run (1-120)")
     p.add_argument("--cdp-url", default=None,
                     help="Route the Scraper API's fetch through your OWN existing browser "

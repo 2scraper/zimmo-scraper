@@ -2,17 +2,16 @@
 fingerprint_client.py
 -----------------
 2Captcha fingerprint fetch + application. No site knowledge -- shared
-verbatim across the 2scraper family (CLAUDE.md §1).
+verbatim across the 2scraper family.
 
 **UNCONFIRMED against a real, current 2Captcha fingerprint API
 response** -- unlike this family's Scraping Browser API integration
-(whose CDP endpoint shape IS confirmed live and documented in
-CLAUDE.md §12). The endpoint path and field names below are a
+(whose CDP endpoint shape IS confirmed live). The endpoint path and field names below are a
 best-effort structure, not verified against real API docs. **Confirm
 `FINGERPRINT_API_URL` and every field name below before depending on
 this in a live run.**
 
-CLAUDE.md §16 documents SIX real, repeated bugs found in this exact
+SIX real, repeated bugs were found in this exact
 module across four sibling repos, all invisible to import/--help/
 compileall/the offline suite/CI, none of them raising -- "the tool
 does less than it says while reporting success". Addressed here from
@@ -24,8 +23,8 @@ the start rather than discovered later:
      the one call it makes, which is lower risk than the family's other
      known leak points -- but `redact_secret_patterns()` is still
      applied to every logged exception here, defensively, since "lower
-     risk" is not "no risk" and this is exactly the bug class CLAUDE.md
-     §8 names as the family's worst.
+     risk" is not "no risk" and a leaked key is the worst
+     bug class this family has had.
   2. **`--fingerprint`/the client never actually setting a user agent**
      (a key the API returns in neither format the code checked for).
      Addressed by trying multiple plausible field-name shapes
@@ -57,8 +56,7 @@ the start rather than discovered later:
      rather than trusting a manual COPY-list review.
 
 Captcha solving, the Scraping Browser API, proxies and fingerprints are
-four SEPARATELY-BILLED 2Captcha products behind one API key (CLAUDE.md
-§12). Never integrate a competitor's fingerprinting product here.
+four SEPARATELY-BILLED 2Captcha products behind one API key. Never integrate a competitor's fingerprinting product here.
 """
 
 import json
@@ -100,8 +98,7 @@ class FingerprintProfile:
 
 
 def _first_present(data: dict, *keys: str, default=None):
-    """Try several plausible field-name shapes in order -- CLAUDE.md
-    §16's bug #2 was exactly one guessed key name failing silently
+    """Try several plausible field-name shapes in order -- bug #2 above was exactly one guessed key name failing silently
     against a real response shaped differently. Trying several is
     still a guess, but a narrower one, and `raw` is kept on the
     returned profile so a real response can be inspected directly."""
@@ -130,10 +127,10 @@ def fetch_fingerprint(api_key: str, *, os_name: str = "windows",
         resp.raise_for_status()
         data = resp.json()
     except (requests.RequestException, json.JSONDecodeError) as e:
-        # CLAUDE.md §16 bug #1: redact defensively even though this
+        # Bug #1 above: redact defensively even though this
         # call's own key rides in the JSON body, not a query string --
         # "lower risk" is not "no risk", and this is the exact bug class
-        # CLAUDE.md §8 names as the family's worst.
+        # a leaked key is the worst bug class this family has had.
         logger.warning("fingerprint_client: could not fetch a fingerprint (%s) -- "
                         "continuing with the engine's own default fingerprint instead.",
                         redact_secret_patterns(str(e)))
@@ -155,7 +152,7 @@ def fetch_fingerprint(api_key: str, *, os_name: str = "windows",
         user_agent=user_agent,
         platform=data.get("platform", "Win32"),
         # Read the API's OWN locale field verbatim -- never construct
-        # one from a country code (CLAUDE.md §16 bug #3: "en-{country}"
+        # one from a country code (bug #3 above: "en-{country}"
         # for a German fingerprint is a malformation this shape cannot
         # produce, by construction, as long as this stays a straight
         # dict read).
@@ -179,10 +176,10 @@ def playwright_context_options(profile: FingerprintProfile) -> Dict[str, Any]:
     """Options for playwright.chromium.launch().new_context(**options).
     Every key here is confirmed against a real, installed Playwright's
     own Browser.new_context() signature via inspect.signature() --
-    see tests/test_fingerprint_kwargs.py (CLAUDE.md §10: "assert that a
-    paid API's kwargs are ones the driver accepts").
+    see tests/test_fingerprint_kwargs.py (a paid API's kwargs must be
+    ones the driver accepts).
 
-    Never call this when connecting via --cdp-endpoint (CLAUDE.md §8):
+    Never call this when connecting via --cdp-endpoint:
     the Scraping Browser brings its own fingerprint, and stacking a
     second on top creates a contradiction rather than better cover."""
     return {
