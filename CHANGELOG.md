@@ -9,6 +9,8 @@ here rather than treated as a violation of the format.
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-10-15
+
 > **Exit codes.** A page whose listing grid rendered but parsed to zero
 > rows is now a parser failure: exit 5 when no row was recovered, exit 6
 > (`partial`, `parser_failed_pages` in the sidecar) when other pages had
@@ -32,6 +34,17 @@ here rather than treated as a violation of the format.
 > unchanged, and the sidecar counts the escaped cells in
 > `csv_cells_escaped`. Output files keep an existing file's mode; a new one
 > gets what the umask allows, as before.
+
+> **Output change.** `rating`, `review_count` and `in_stock` are gone from
+> every JSON row and from the CSV header. A consumer that selects them by
+> name will now fail on a missing key; one that reads by position will see
+> every later column move left by up to three. They were shop columns
+> inherited with the family's row: nothing in this repo ever assigned them
+> (no write to any of the three in `product_parser.py`), and they were null
+> on 21 of 21 rows of the real 2026-09-23 capture. `brand`,
+> `original_price` and `discount_pct` stay: the embedded-JSON path still
+> fills them when a page serves that JSON, even though the Angular pages
+> served today leave them empty.
 
 ### Fixed
 
@@ -65,6 +78,11 @@ here rather than treated as a violation of the format.
   refuses GitHub's runners and a run that never reached the site tested
   nothing. Any nonzero exit (block, zero rows, parser failure, partial)
   is red.
+- The canary is split into a `gate` job and the live job. With no
+  `ZIMMO_PROXY` secret the live job is SKIPPED with a notice, instead of
+  running, being refused by Cloudflare and exiting 0. Exit 3 with a proxy
+  is now a red run, as it should be. GitHub still colours the workflow
+  badge green when its only live job was skipped; the README says so.
 
 ### Not changed
 
@@ -73,21 +91,9 @@ here rather than treated as a violation of the format.
   captures over `--cdp-endpoint`, which this change did not take.
 - The family flags `--fingerprint`, `--fp-*`, `--locale` and `--mode`, and
   whether to keep `fingerprint_client.py`: an owner decision.
-- The three per-engine fetch loops (no shared-loop refactor); version,
-  tag and release of 1.3.0.
-
-## [1.3.0] — a published row schema, three columns removed, a canary that can say "not run" (2026-10-13)
-
-> **Output change.** `rating`, `review_count` and `in_stock` are gone from
-> every JSON row and from the CSV header. A consumer that selects them by
-> name will now fail on a missing key; one that reads by position will see
-> every later column move left by up to three. They were shop columns
-> inherited with the family's row: nothing in this repo ever assigned them
-> (no write to any of the three in `product_parser.py`), and they were null
-> on 21 of 21 rows of the real 2026-09-23 capture. `brand`,
-> `original_price` and `discount_pct` stay: the embedded-JSON path still
-> fills them when a page serves that JSON, even though the Angular pages
-> served today leave them empty.
+- The three engines still carry their own page loop. Moving it into a
+  shared module is a refactor that needs a live run of all three.
+- Playwright stays pinned to 1.44.0 alongside the Docker base image.
 
 ### Added
 
@@ -98,20 +104,6 @@ here rather than treated as a violation of the format.
 - canary assertions on the data itself: unique non-empty `sku`s, prices in
   a plausible range, no `original_price` at or below its `price`, every
   URL on zimmo.be.
-
-### Changed
-
-- The canary is split into a `gate` job and the live job. With no
-  `ZIMMO_PROXY` secret the live job is SKIPPED with a notice, instead of
-  running, being refused by Cloudflare and exiting 0. Exit 3 with a proxy
-  is now a red run, as it should be. GitHub still colours the workflow
-  badge green when its only live job was skipped; the README says so.
-
-### Not changed
-
-- The three engines still carry their own page loop. Moving it into a
-  shared module is a refactor that needs a live run of all three.
-- Playwright stays pinned to 1.44.0 alongside the Docker base image.
 
 ## [1.2.1] — one CDP connection per run (2026-10-07)
 
