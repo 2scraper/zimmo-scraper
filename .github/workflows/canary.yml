@@ -35,7 +35,7 @@ jobs:
           ZIMMO_PROXY: ${{ secrets.ZIMMO_PROXY }}
         run: |
           if [ -z "$ZIMMO_PROXY" ]; then
-            echo "::error::ZIMMO_PROXY is missing or empty, so this canary cannot reach zimmo.be (it refuses GitHub runners' addresses). Set the ZIMMO_PROXY repository secret to a residential proxy URL with a Belgian or German exit, e.g. http://user:pass@host:port. This run tested nothing."
+            echo "::error::ZIMMO_PROXY is missing or empty, so this canary cannot reach zimmo.be (it refuses GitHub runners' addresses). Set the ZIMMO_PROXY repository secret to a residential proxy URL (credentials, host and port) with a Belgian or German exit. This run tested nothing."
             exit 1
           fi
           echo "[canary] ZIMMO_PROXY is set (value masked)."
