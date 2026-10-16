@@ -1,6 +1,6 @@
 name: canary
 
-# One real run daily against a known-good search URL, >=3 pages, so
+# One real run weekly (Mondays; every run bills the proxy) against a known-good search URL, >=3 pages, so
 # pagination is exercised and not only page 1. Artefacts are uploaded on
 # every run, so a red canary can be diagnosed from the run alone.
 #
@@ -14,7 +14,7 @@ name: canary
 
 on:
   schedule:
-    - cron: "17 6 * * *"  # daily, off the hour to avoid the top-of-hour GitHub Actions crush
+    - cron: "17 6 * * 1"  # Mondays (weekly: every run bills the proxy), off the hour to avoid the top-of-hour GitHub Actions crush
   workflow_dispatch: {}
   # Also run when THIS file changes. A canary is the one workflow that
   # can sit broken for a full day before anyone finds out.
