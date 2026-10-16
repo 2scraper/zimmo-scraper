@@ -285,7 +285,7 @@ Scraping Browser API session), or supply a display yourself and pass
 `--headful`.
 
 A separate `canary` workflow runs live against a real filtered category
-once a day: 3 pages, headful under xvfb, with assertions on the share of
+once a week (Mondays): 3 pages, headful under xvfb, with assertions on the share of
 rows carrying a price, living area, bedrooms, energy grade and property
 type. It needs a residential exit — measured 2026-09-23 and 2026-10-13,
 GitHub's runner is refused like any datacentre address, and a US

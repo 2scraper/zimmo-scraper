@@ -9,6 +9,12 @@ here rather than treated as a violation of the format.
 
 ## [Unreleased]
 
+### Changed
+
+- CI only: the canary bills the `ZIMMO_PROXY` exit, so its schedule is now
+  weekly (Mondays 06:17 UTC) instead of daily; a manual dispatch, and a push that
+  changes the canary file, still run it.
+
 ## [2.0.0] — 2026-10-15
 
 > **Major version for a schema break.** 2.0.0 is the same code as 1.3.0,
