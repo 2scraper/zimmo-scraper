@@ -52,10 +52,11 @@ from captcha_solver import (
 )
 from product_parser import parse_products, SELECTORS
 from output_writer import (
-    Product, finish_run, dedupe_by_sku, EXIT_CRASH,
+    Product, finish_run, finish_without_fetch, dedupe_by_sku, EXIT_CRASH,
     classify_page, page_outcome_is_ok, should_retry_page, status_rules_out_listings,
     PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, split_page_result,
 )
+import proxy_check
 from env_config import (
     apply_env_defaults, non_negative_int, positive_int, non_negative_float,
     refuse_proxy_with_cdp_endpoint,
@@ -135,6 +136,8 @@ def build_driver(args, proxy_server_only: Optional[str] = None) -> webdriver.Chr
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     })
+    if proxy_check.block_media(args, proxy_server_only, remote=False):
+        proxy_check.install_selenium(driver)
     return driver
 
 
@@ -419,6 +422,15 @@ def scrape(args) -> int:
     warn_if_concurrency_without_pool(args.concurrency, proxy_pool)
     refuse_concurrency_with_cdp_endpoint(args.concurrency, args.cdp_endpoint)
 
+    # One request through the proxy before a browser exists: a 407 or 402
+    # from the gateway ends the run here, in seconds, instead of surfacing
+    # as a navigation timeout after every retry.
+    refused = proxy_check.gate(proxy_pool, args.url)
+    if refused:
+        return finish_without_fetch(
+            args.out, stop_reason=refused.stop_reason,
+            pages_requested=args.pages, url=args.url, started_at=started_at)
+
     url_1 = page_url(args.url, 1)
     (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
         _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0))
@@ -504,6 +516,7 @@ def parse_args():
     p.add_argument("--solve-captcha", choices=["always", "when-blocked", "never"], default="when-blocked")
     p.add_argument("--min-score", type=float, default=None,
                     help="Minimum acceptable reCAPTCHA v3 score to request from the solver")
+    proxy_check.add_media_flags(p)
     p.add_argument("--cdp-endpoint", default=None,
                     help="BEST-EFFORT: attach via Selenium's debuggerAddress. Does NOT forward "
                          "URL-embedded credentials -- for an authenticated remote endpoint use "

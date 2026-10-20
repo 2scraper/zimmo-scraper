@@ -313,6 +313,43 @@ def write_meta(meta: Dict[str, Any], out_prefix: str) -> None:
     print(f"[+] Saved run metadata -> {out_prefix}.meta.json")
 
 
+ATTEMPT_META_SUFFIX = ".latest_attempt.meta.json"
+
+
+def finish_without_fetch(out_prefix: str, *, stop_reason: str,
+                         pages_requested: int, url: Optional[str] = None,
+                         started_at: Optional[str] = None) -> int:
+    """End a run that was stopped before anything was fetched; exit 5.
+
+    Used by the proxy pre-check (a 407 or 402 from the proxy). The record
+    goes to `<out>.latest_attempt.meta.json`, NOT `<out>.meta.json`: the
+    latter describes the data file beside it, and a previous run's good
+    output is still there, untouched, so overwriting its metadata with
+    `status: failed` would make the pair contradict each other.
+    """
+    path = f"{out_prefix}{ATTEMPT_META_SUFFIX}"
+    with _atomic_open(path) as f:
+        json.dump({
+            "status": "failed",
+            "stop_reason": stop_reason,
+            "pages_requested": pages_requested,
+            "pages_completed": 0,
+            "failed_pages": [],
+            "unattempted_pages": list(range(1, pages_requested + 1)),
+            "selection": {"url": selection_url(url) if url else None,
+                          "pages_requested": pages_requested},
+            "product_count": 0,
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "source": "zimmo.be",
+        }, f, ensure_ascii=False, indent=2)
+    print(f"[+] Saved attempt metadata -> {path} (status=failed, "
+          f"stop_reason={stop_reason})")
+    print(f"[!] Failed run: nothing was fetched ({stop_reason}). Any previous "
+          f"output and its .meta.json are untouched.")
+    return EXIT_FETCH_FAILED
+
+
 def finish_run(
     products: List[Product],
     out_prefix: str,

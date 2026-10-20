@@ -75,6 +75,9 @@ ENV_KEYS: Dict[str, str] = {
     "ZIMMO_CDP_ENDPOINT": "cdp_endpoint",
     "ZIMMO_PROXY": "proxy",
     "ZIMMO_URL": "url",
+    # "1" = always load images/video/fonts (--load-media). --load-media
+    # defaults to None, not False, so this loader can still fill it.
+    "ZIMMO_LOAD_MEDIA": "load_media",
 }
 
 # A copied .env.example placeholder is treated as unset, not as a real
