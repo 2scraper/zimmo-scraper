@@ -173,6 +173,8 @@ python3 scraper_api_client.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/"
 | `--allow-empty` | off | Write output even if zero products were found |
 | `--dump-html` | off | Always save a per-page debug `.html`/`.png`, including on success |
 | `--headless` / `--headful` | headless | Toggle a visible browser window |
+| `--block-media` | off | Through a local proxy, skip images, video/audio and fonts to save proxy traffic (see [Proxy traffic savers](#proxy-traffic-savers)) |
+| `--load-media` | on (or `ZIMMO_LOAD_MEDIA=1`) | Always load them, the default here |
 
 The full set above is identical across all three engines — asserted
 automatically by `smoke_test.py`, not just by having copied one file
@@ -213,6 +215,38 @@ Two confirmed engine-specific limits:
   credential embedded in `--proxy` is stripped, with a warning, rather
   than silently doing nothing useful.
 
+### Proxy traffic savers
+
+A proxy is billed by traffic. With `--proxy` / `--proxy-file` /
+`ZIMMO_PROXY`, every engine first makes **one pre-check request** through
+it, before any browser starts: a CONNECT to www.zimmo.be and a
+`HEAD /robots.txt` inside the tunnel. Chromium reports a proxy's HTTP 407
+as a navigation timeout, so a wrong or exhausted credential used to spend
+every retry and rotation first. Now:
+
+- **407** (the gateway refused the credential, or the traffic balance is
+  exhausted) or **402** (proxy traffic/balance exhausted) ends the run in
+  seconds with **exit 5**. The run writes `<out>.latest_attempt.meta.json`
+  (`status: failed`, `stop_reason: proxy_auth_failed` or
+  `proxy_balance_exhausted`) and leaves any previous output and its
+  `.meta.json` alone. The message names `ZIMMO_PROXY` and never prints the
+  credential.
+- A proxy that does not answer at all keeps the old behaviour: a warning,
+  then the browser's own attempt and the usual retries.
+- Nothing is pre-checked without a proxy or with `--cdp-endpoint`.
+
+**Media blocking is opt-in here** (`--block-media`). Through a local proxy,
+it aborts image, video/audio and font requests: Playwright by resource
+type, pyppeteer through CDP's Fetch domain, and Selenium by file extension
+with CDP `Network.setBlockedURLs`. It is off by default on zimmo.be. This
+site serves only a residential exit driving a headful browser, and a free
+comparison from a datacentre address (2026-10-20, headful, no proxy) got
+Cloudflare's HTTP 403. So a media-blocked run could not be checked
+against a normal one, and a bot manager this strict may score a browser
+that never fetches images or fonts. The parser reads the page's listing
+JSON and text, not media. Measure it on your own exit before relying on
+it. It is never applied over `--cdp-endpoint`.
+
 ## Output
 
 Each run writes `<out>.json` / `<out>.csv` (per `--format`) plus
@@ -241,6 +275,7 @@ captcha solve, across all its attempts and proxy rotations.
 Exit codes, identical across all engines: `0` ok · `1` crash ·
 `2` bad usage · `3` blocked · `4` zero products (no `--allow-empty`) ·
 `5` the content was never obtained (a remote API error, a dead proxy, a
+proxy that refused its credential or balance before the run began, a
 load timeout, an HTTP error or 404 on page 1, or a rendered page the parser
 read nothing from) · `6` partial (some pages failed, were blocked or
 parsed to nothing). The Scraper API path uses the same page verdicts.

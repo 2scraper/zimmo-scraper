@@ -59,10 +59,11 @@ from captcha_solver import (
 )
 from product_parser import parse_products, SELECTORS
 from output_writer import (
-    Product, finish_run, dedupe_by_sku, EXIT_CRASH,
+    Product, finish_run, finish_without_fetch, dedupe_by_sku, EXIT_CRASH,
     classify_page, page_outcome_is_ok, should_retry_page, status_rules_out_listings,
     PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, split_page_result,
 )
+import proxy_check
 from env_config import (
     apply_env_defaults, non_negative_int, positive_int, non_negative_float,
     refuse_proxy_with_cdp_endpoint,
@@ -341,6 +342,8 @@ def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, current
                         logger.info("Using proxy exit: %s", current_exit.masked())
                     browser = pw.chromium.launch(**launch_kwargs)
                     context = browser.new_context(locale="nl-BE")
+                    if proxy_check.block_media(args, current_exit, remote=False):
+                        proxy_check.install_playwright(context)
                     page = context.new_page()
 
                 logger.info("Loading %s (page %d, attempt %d/%d)",
@@ -547,6 +550,15 @@ def _scrape(args, cdp: Optional[CdpConnection]) -> int:
     warn_if_concurrency_without_pool(args.concurrency, proxy_pool)
     refuse_concurrency_with_cdp_endpoint(args.concurrency, args.cdp_endpoint)
 
+    # One request through the proxy before a browser exists: a 407 or 402
+    # from the gateway ends the run here, in seconds, instead of surfacing
+    # as a navigation timeout after every retry.
+    refused = proxy_check.gate(proxy_pool, args.url)
+    if refused:
+        return finish_without_fetch(
+            args.out, stop_reason=refused.stop_reason,
+            pages_requested=args.pages, url=args.url, started_at=started_at)
+
     # Page 1 is always fetched alone (its own sync_playwright() context
     # -- see _fetch_page's own docstring for why every call, including
     # this one in the main thread, manages its own context uniformly).
@@ -650,6 +662,7 @@ def parse_args():
     p.add_argument("--solve-captcha", choices=["always", "when-blocked", "never"], default="when-blocked")
     p.add_argument("--min-score", type=float, default=None,
                     help="Minimum acceptable reCAPTCHA v3 score to request from the solver")
+    proxy_check.add_media_flags(p)
     p.add_argument("--cdp-endpoint", default=None,
                     help="Connect to an existing browser over CDP instead of launching Playwright's "
                          "bundled Chromium. Refused together with --proxy/--proxy-file (the remote "

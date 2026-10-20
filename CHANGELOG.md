@@ -9,6 +9,32 @@ here rather than treated as a violation of the format.
 
 ## [Unreleased]
 
+> **Behaviour change.** A run through a proxy now makes one pre-check
+> request before starting a browser. A proxy that answers **HTTP 407** or
+> **402** ends the run with **exit 5** and `<out>.latest_attempt.meta.json`
+> (`status: failed`, `stop_reason: proxy_auth_failed` /
+> `proxy_balance_exhausted`) instead of timing out on every retry and
+> rotation. Runs without a proxy or over `--cdp-endpoint` are unchanged.
+
+### Added
+
+- `proxy_check.py`: the proxy pre-check (one CONNECT plus `HEAD /robots.txt`
+  on www.zimmo.be, no third-party service), wired into all three engines
+  before the first browser launch. The 407 message names `ZIMMO_PROXY` and
+  says the gateway refused the credential (or the traffic balance is
+  exhausted); a 402 says the proxy traffic/balance is exhausted. Neither
+  prints the credential. A proxy that does not answer keeps the existing
+  retry behaviour.
+- `--block-media` (opt-in, all three engines): through a local proxy, skip
+  images, video/audio and fonts. Off by default on this site because a
+  blocked run could not be compared with a normal one (zimmo.be refuses
+  datacentre addresses), and a strict bot manager may score it.
+  `--load-media` / `ZIMMO_LOAD_MEDIA=1` keeps them (the default).
+- Offline checks: a stub proxy answering 407/402/200 or nothing, each engine
+  driven to exit 5 without a browser on a 407, the attempt sidecar, the
+  Playwright route handler, the pyppeteer Fetch patterns, the Selenium
+  blocked-URL list, and when each engine installs blocking.
+
 ### Changed
 
 - CI only: the canary bills the `ZIMMO_PROXY` exit, so its schedule is now
