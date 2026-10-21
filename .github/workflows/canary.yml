@@ -65,11 +65,20 @@ jobs:
             --pages 3 \
             --headful \
             --format both \
+            --proxy-budget-mb 10 \
             --out canary_run \
             --dump-html
           code=$?
           echo "exit_code=$code" >> "$GITHUB_ENV"
           echo "[canary] engine exit code: $code"
+
+      - name: Proxy traffic of the run
+        # The run meters what it sends through ZIMMO_PROXY and stops at
+        # --proxy-budget-mb 10. This puts the figure in the step summary and
+        # fails the job when the cap was hit, so a page that has grown heavy
+        # is a red run rather than a quietly larger bill.
+        if: ${{ !cancelled() }}
+        run: python3 .github/proxy_traffic.py "canary" canary_run
 
       - name: Assert the run actually succeeded
         run: |

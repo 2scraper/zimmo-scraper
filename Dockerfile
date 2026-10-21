@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-playwright.tx
 # Exactly what playwright_scraper.py's own import graph needs, and
 # nothing else -- no tests/, no .env, no sample_output.*, no README.
 COPY env_config.py output_writer.py product_parser.py captcha_solver.py \
-     proxy_pool.py proxy_check.py playwright_scraper.py ./
+     proxy_pool.py proxy_check.py proxy_meter.py playwright_scraper.py ./
 
 # The exact invocation a missing module breaks -- CI's
 # docker-build job actually runs this, rather than trusting that the

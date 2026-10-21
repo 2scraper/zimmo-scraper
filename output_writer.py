@@ -366,7 +366,71 @@ def finish_run(
     exhausted_pages: Optional[List[int]] = None,
     url: Optional[str] = None,
     parser_failed_pages: Optional[List[int]] = None,
+    proxy: Optional[Dict[str, Any]] = None,
 ) -> int:
+    """`proxy` is the proxy meter's record (proxy_meter.ProxyMeter.sidecar)
+    on a run through a local proxy, None otherwise. When present it goes
+    into `<out>.meta.json`, and the run ALSO writes
+    `<out>.latest_attempt.meta.json` -- every time, rows or not -- so a run
+    that wrote nothing still says what it spent. A run that went over its
+    budget stops with stop_reason `proxy_budget_exceeded`: exit 6 with rows,
+    exit 5 without, never a complete or empty result.
+    """
+    rc, meta = _finish_run(
+        products, out_prefix, fmt, pages_requested=pages_requested,
+        pages_completed=pages_completed, failed_pages=failed_pages,
+        unattempted_pages=unattempted_pages, blocked=blocked,
+        remote_api_error=remote_api_error, allow_empty=allow_empty,
+        started_at=started_at, exhausted_pages=exhausted_pages, url=url,
+        parser_failed_pages=parser_failed_pages, proxy=proxy)
+    if proxy is not None:
+        if meta is None:
+            # Nothing was written; record the attempt without touching any
+            # previous output or its .meta.json.
+            meta = {
+                "status": "blocked" if rc == EXIT_BLOCKED else (
+                    "empty" if rc == EXIT_ZERO_PRODUCTS else "failed"),
+                "stop_reason": (STOP_PROXY_BUDGET_EXCEEDED
+                                if proxy.get("proxy_budget_exceeded") else
+                                {EXIT_BLOCKED: "blocked",
+                                 EXIT_ZERO_PRODUCTS: "zero products"}.get(
+                                     rc, "content not obtained")),
+                "exit_code": rc,
+                "pages_requested": pages_requested,
+                "pages_completed": pages_completed,
+                "failed_pages": sorted(set(failed_pages or [])
+                                       | set(parser_failed_pages or [])),
+                "unattempted_pages": unattempted_pages or [],
+                "selection": {"url": selection_url(url) if url else None,
+                              "pages_requested": pages_requested},
+                "product_count": len(products),
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "source": "zimmo.be",
+                **proxy,
+            }
+        write_attempt_meta(meta, out_prefix)
+    return rc
+
+
+# The stop reason of a run that went over --proxy-budget-mb.
+STOP_PROXY_BUDGET_EXCEEDED = "proxy_budget_exceeded"
+
+
+def write_attempt_meta(meta: Dict[str, Any], out_prefix: str) -> str:
+    """Write `<out>.latest_attempt.meta.json`: this attempt, whatever it got."""
+    path = f"{out_prefix}{ATTEMPT_META_SUFFIX}"
+    with _atomic_open(path) as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print(f"[+] Saved attempt metadata -> {path} (status={meta.get('status')}, "
+          f"stop_reason={meta.get('stop_reason')})")
+    return path
+
+
+def _finish_run(products, out_prefix, fmt, *, pages_requested, pages_completed,
+                failed_pages, unattempted_pages, blocked, remote_api_error,
+                allow_empty, started_at, exhausted_pages, url,
+                parser_failed_pages, proxy):
     """The single place that decides status, exit code, and whether/what
     to write.
 
@@ -405,23 +469,33 @@ def finish_run(
     parser_failed_pages = sorted(set(parser_failed_pages or []))
     failed_pages = sorted(set(failed_pages) | set(parser_failed_pages))
     finished_at = datetime.now(timezone.utc).isoformat()
+    budget_stop = bool(proxy and proxy.get("proxy_budget_exceeded"))
+    if budget_stop:
+        # The requests after the cap were refused, so the run cannot have
+        # seen the end of the listing, nor a block or an empty search.
+        exhausted_pages = []
+        if not products:
+            print("[!] Proxy budget exceeded before any listing was recovered "
+                  "(proxy_budget_exceeded) -- the content was never obtained. "
+                  "Writing nothing, leaving any previous good output in place.")
+            return EXIT_FETCH_FAILED, None
 
     if remote_api_error and not products:
         print("[!] Remote API error and zero products recovered -- writing nothing, "
               "leaving any previous good output in place.")
-        return EXIT_REMOTE_API_ERROR
+        return EXIT_REMOTE_API_ERROR, None
 
     if blocked and not products:
         print("[!] Run appears blocked (bot-challenge/captcha) and zero products "
               "were recovered -- writing nothing, leaving any previous good output "
               "in place.")
-        return EXIT_BLOCKED
+        return EXIT_BLOCKED, None
 
     if not products and parser_failed_pages:
         print(f"[!] Page(s) {parser_failed_pages} rendered a listing grid but the parser "
               f"read zero listings from it -- a parser failure, not an empty search. "
               f"Writing nothing, leaving any previous good output in place.")
-        return EXIT_FETCH_FAILED
+        return EXIT_FETCH_FAILED, None
 
     # A page was attempted and failed, and no listing was recovered from
     # any page: the content was never obtained (a dead proxy, a load
@@ -433,15 +507,19 @@ def finish_run(
         print(f"[!] {len(failed_pages)} attempted page(s) {failed_pages} could not be fetched "
               f"and no listing was recovered -- the content was never obtained. Writing "
               f"nothing, leaving any previous good output in place.")
-        return EXIT_FETCH_FAILED
+        return EXIT_FETCH_FAILED, None
 
     if not products and not allow_empty:
         print(f"[!] Zero products found across {pages_completed}/{pages_requested} "
               f"page(s) -- writing NOTHING so this doesn't overwrite a previous good "
               f"run. Pass --allow-empty to force writing an empty result.")
-        return EXIT_ZERO_PRODUCTS
+        return EXIT_ZERO_PRODUCTS, None
 
-    if parser_failed_pages:
+    if budget_stop:
+        status = "partial"
+        stop_reason = STOP_PROXY_BUDGET_EXCEEDED
+        exit_code = EXIT_PARTIAL
+    elif parser_failed_pages:
         status = "partial"
         other = [p for p in failed_pages if p not in parser_failed_pages]
         stop_reason = (f"parser found nothing on rendered page(s) {parser_failed_pages}"
@@ -474,7 +552,7 @@ def finish_run(
         exit_code = EXIT_OK
 
     csv_cells_escaped = save(products, out_prefix, fmt)
-    write_meta({
+    meta = {
         "status": status,
         "stop_reason": stop_reason,
         "pages_requested": pages_requested,
@@ -491,9 +569,11 @@ def finish_run(
         "finished_at": finished_at,
         "source": "zimmo.be",
         "csv_cells_escaped": csv_cells_escaped,
-    }, out_prefix)
+        **(proxy or {}),
+    }
+    write_meta(meta, out_prefix)
 
-    return exit_code
+    return exit_code, meta
 
 
 def dedupe_by_sku(products: List[Product]) -> List[Product]:

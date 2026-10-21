@@ -64,6 +64,7 @@ from output_writer import (
     PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, split_page_result,
 )
 import proxy_check
+import proxy_meter
 from env_config import (
     apply_env_defaults, non_negative_int, positive_int, non_negative_float,
     refuse_proxy_with_cdp_endpoint,
@@ -322,6 +323,8 @@ def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, current
     # every proxy rotation below (captcha_solver.SolveBudget).
     budget = SolveBudget()
     for attempt in range(args.retries + 1):
+        # Before a browser is even launched for this attempt.
+        proxy_meter.check(args)
         browser = None
         page = None
         try:
@@ -344,6 +347,9 @@ def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, current
                     context = browser.new_context(locale="nl-BE")
                     if proxy_check.block_media(args, current_exit, remote=False):
                         proxy_check.install_playwright(context)
+                    # After the media route, so the budget route runs first
+                    # (Playwright runs routes in reverse registration order).
+                    proxy_meter.install_playwright(context, proxy_meter.of(args))
                     page = context.new_page()
 
                 logger.info("Loading %s (page %d, attempt %d/%d)",
@@ -468,6 +474,10 @@ def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency:
 
     def record(page_num, result):
         nonlocal any_blocked, any_remote_error, seen_skus
+        if result is None:
+            # Stopped by the proxy budget before it was fetched.
+            unattempted_pages.append(page_num)
+            return
         products, ok, blocked, remote_err = result
         page_results[page_num] = products
         any_blocked = any_blocked or blocked
@@ -485,6 +495,12 @@ def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency:
     def call(page_num, result_fn):
         try:
             return result_fn()
+        except proxy_meter.ProxyBudgetExceeded as e:
+            # One meter for every worker: the first page that meets the cap
+            # stops dispatch for all of them.
+            logger.error("Page %d not fetched: %s.", page_num, e)
+            stop_event.set()
+            return None
         except Exception as e:
             logger.error("Worker raised while fetching page %d: %s",
                          page_num, redact_secret_patterns(str(e)))
@@ -558,13 +574,19 @@ def _scrape(args, cdp: Optional[CdpConnection]) -> int:
         return finish_without_fetch(
             args.out, stop_reason=refused.stop_reason,
             pages_requested=args.pages, url=args.url, started_at=started_at)
+    meter = proxy_meter.start(args, proxy_pool, remote=bool(args.cdp_endpoint))
 
     # Page 1 is always fetched alone (its own sync_playwright() context
     # -- see _fetch_page's own docstring for why every call, including
     # this one in the main thread, manages its own context uniformly).
     url_1 = page_url(args.url, 1)
-    (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
-        _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0, cdp=cdp))
+    try:
+        (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
+            _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0, cdp=cdp))
+    except proxy_meter.ProxyBudgetExceeded as e:
+        logger.error("Stopping: %s.", e)
+        (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = \
+            ([], False, False, False), False
 
     page_results = {1: products_1}
     failed_pages = [] if ok_1 else [1]
@@ -580,6 +602,11 @@ def _scrape(args, cdp: Optional[CdpConnection]) -> int:
         logger.warning("Page 1 failed entirely -- not attempting pages 2..%d, since page "
                         "1's own result decides whether the site can be addressed "
                         "independently.", args.pages)
+        unattempted_pages = remaining_pages
+        remaining_pages = []
+    if remaining_pages and meter is not None and meter.exceeded:
+        logger.error("Stopping after page 1: the proxy budget is spent; pages "
+                     "2..%d are not requested.", args.pages)
         unattempted_pages = remaining_pages
         remaining_pages = []
 
@@ -604,6 +631,12 @@ def _scrape(args, cdp: Optional[CdpConnection]) -> int:
         # Pages left undispatched because a page added no new sku: the
         # listing ENDED, which is a complete answer, not a gap in one.
         exhausted_pages = more_unattempted
+        if meter is not None and meter.exceeded:
+            # ...unless the proxy budget stopped dispatch: then they were
+            # simply never asked for.
+            unattempted_pages = sorted(set(unattempted_pages)
+                                       | set(more_unattempted))
+            exhausted_pages = []
 
     # Merge in PAGE ORDER, not arrival order.
     all_products = [p for page_num in sorted(page_results) for p in page_results[page_num]]
@@ -625,6 +658,7 @@ def _scrape(args, cdp: Optional[CdpConnection]) -> int:
         started_at=started_at,
         exhausted_pages=exhausted_pages, url=args.url,
         parser_failed_pages=parser_failed_pages,
+        proxy=proxy_meter.finish(args),
     )
 
 
@@ -663,6 +697,7 @@ def parse_args():
     p.add_argument("--min-score", type=float, default=None,
                     help="Minimum acceptable reCAPTCHA v3 score to request from the solver")
     proxy_check.add_media_flags(p)
+    proxy_meter.add_budget_flag(p)
     p.add_argument("--cdp-endpoint", default=None,
                     help="Connect to an existing browser over CDP instead of launching Playwright's "
                          "bundled Chromium. Refused together with --proxy/--proxy-file (the remote "

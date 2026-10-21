@@ -175,6 +175,7 @@ python3 scraper_api_client.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/"
 | `--headless` / `--headful` | headless | Toggle a visible browser window |
 | `--block-media` | off | Through a local proxy, skip images, video/audio and fonts to save proxy traffic (see [Proxy traffic savers](#proxy-traffic-savers)) |
 | `--load-media` | on (or `ZIMMO_LOAD_MEDIA=1`) | Always load them, the default here |
+| `--proxy-budget-mb` | 10 (or `ZIMMO_PROXY_BUDGET_MB`) | Stop the run once this many MB (10^6 bytes) went through a local proxy; `0` = no cap (see [Proxy traffic savers](#proxy-traffic-savers)) |
 
 The full set above is identical across all three engines — asserted
 automatically by `smoke_test.py`, not just by having copied one file
@@ -247,6 +248,31 @@ that never fetches images or fonts. The parser reads the page's listing
 JSON and text, not media. Measure it on your own exit before relying on
 it. It is never applied over `--cdp-endpoint`.
 
+**Every run through a local proxy is metered and capped.**
+`--proxy-budget-mb` (default **10**, `0` = no cap, also
+`ZIMMO_PROXY_BUDGET_MB`). Once more than that has gone through the proxy,
+further requests are refused, no further page attempt starts a browser
+(every `--concurrency` worker shares one meter and stops dispatching), the
+rows already gathered are kept and the run exits **6** (or **5** with no
+rows), `stop_reason: proxy_budget_exceeded`. It never carries on past the
+cap. `<out>.meta.json`, and `<out>.latest_attempt.meta.json`, which every
+metered run writes, rows or not, carry `proxy_bytes`, `proxy_budget_bytes`
+(`null` with no cap) and `proxy_budget_exceeded`, and the log ends with
+`Proxy traffic: X.X MB of Y MB budget`.
+
+How the bytes are counted, per engine: Playwright sums `request.sizes()`
+(request headers + body, response headers + body) of every finished or
+failed request; pyppeteer reads CDP `Network.loadingFinished.encodedDataLength`
+(bytes received, headers included) plus each request's line, headers and
+body from `Network.requestWillBeSent`; Selenium reads the same CDP events
+from chromedriver's performance log after each page. The figure is an
+**estimate of the payload through the tunnel**: TLS, the CONNECT exchange
+and connections the browser opens for itself are not visible to any of the
+engines, and add a few percent. Measured 2026-10-21 against a local stub
+proxy that counted every byte it carried (a 60 kB page, a 30 kB stylesheet,
+a 90 kB script): Playwright 1.44 within 0.2%, pyppeteer 0.6%, Selenium
+0.7%. Nothing is metered without a proxy or over `--cdp-endpoint`.
+
 ## Output
 
 Each run writes `<out>.json` / `<out>.csv` (per `--format`) plus
@@ -277,8 +303,9 @@ Exit codes, identical across all engines: `0` ok · `1` crash ·
 `5` the content was never obtained (a remote API error, a dead proxy, a
 proxy that refused its credential or balance before the run began, a
 load timeout, an HTTP error or 404 on page 1, or a rendered page the parser
-read nothing from) · `6` partial (some pages failed, were blocked or
-parsed to nothing). The Scraper API path uses the same page verdicts.
+read nothing from, or the proxy budget spent before any row) · `6` partial
+(some pages failed, were blocked or parsed to nothing, or
+`--proxy-budget-mb` stopped the run: `stop_reason: proxy_budget_exceeded`). The Scraper API path uses the same page verdicts.
 
 In the CSV, a text cell starting with `=`, `+`, `-`, `@`, a tab, CR or LF
 is prefixed with an apostrophe so a spreadsheet does not run it as a
