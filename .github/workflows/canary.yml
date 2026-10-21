@@ -16,12 +16,8 @@ on:
   schedule:
     - cron: "17 6 * * 1"  # Mondays (weekly: every run bills the proxy), off the hour to avoid the top-of-hour GitHub Actions crush
   workflow_dispatch: {}
-  # Also run when THIS file changes. A canary is the one workflow that
-  # can sit broken for a full day before anyone finds out.
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/canary.yml"
+  # No push trigger: every run bills the proxy, so a change to this file is
+  # verified by dispatching it by hand, not by merging it.
 
 jobs:
   canary:

@@ -64,6 +64,7 @@ here rather than treated as a violation of the format.
 
 ### Changed
 
+- CI: the canary no longer runs on a push that changes `canary.yml`; it runs weekly (Mondays) and on manual dispatch only, because every run bills the proxy.
 - `pyproject.toml` lists `proxy_check` (missing since it was added) and
   `proxy_meter` among the installed modules.
 - CI only: the canary bills the `ZIMMO_PROXY` exit, so its schedule is now
