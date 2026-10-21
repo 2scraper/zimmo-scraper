@@ -70,6 +70,10 @@ here rather than treated as a violation of the format.
   weekly (Mondays 06:17 UTC) instead of daily; a manual dispatch, and a push that
   changes the canary file, still run it.
 
+### Fixed
+
+- The pyppeteer and Selenium proxy meter counts only `http://` / `https://` requests and responses that came over the network. Chrome's own loads (the `chrome://` new-tab page, `data:`, `blob:`), cache hits (`requestServedFromCache`, `fromDiskCache`, `fromPrefetchCache`, `fromServiceWorker`) and Chrome's error page count nothing. A sibling repo's Selenium run had counted about 2.8 MB of new-tab scripts while its proxy carried about 6 KB. The pyppeteer block sent once the budget is spent now reaches the page's own event loop even when the budget runs out on another thread.
+
 ## [2.0.0] — 2026-10-15
 
 > **Major version for a schema break.** 2.0.0 is the same code as 1.3.0,
