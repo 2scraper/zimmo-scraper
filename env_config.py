@@ -78,6 +78,9 @@ ENV_KEYS: Dict[str, str] = {
     # "1" = always load images/video/fonts (--load-media). --load-media
     # defaults to None, not False, so this loader can still fill it.
     "ZIMMO_LOAD_MEDIA": "load_media",
+    # Proxy traffic cap per run in MB (--proxy-budget-mb); empty = 10.
+    # --proxy-budget-mb defaults to None for the same reason.
+    "ZIMMO_PROXY_BUDGET_MB": "proxy_budget_mb",
 }
 
 # A copied .env.example placeholder is treated as unset, not as a real

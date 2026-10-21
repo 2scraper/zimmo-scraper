@@ -45,6 +45,7 @@ from output_writer import (
     PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, split_page_result,
 )
 import proxy_check
+import proxy_meter
 from env_config import (
     apply_env_defaults, non_negative_int, positive_int, non_negative_float,
     refuse_proxy_with_cdp_endpoint,
@@ -282,6 +283,8 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
     # every proxy rotation below (captcha_solver.SolveBudget).
     budget = SolveBudget()
     for attempt in range(args.retries + 1):
+        # Before a browser is even launched for this attempt.
+        proxy_meter.check(args)
         browser = None
         page = None
         try:
@@ -307,6 +310,7 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
                     await _authenticate_proxy(page, username, password)
                 if proxy_check.block_media(args, current_exit, remote=False):
                     await proxy_check.install_pyppeteer(page)
+                await proxy_meter.install_pyppeteer(page, proxy_meter.of(args))
 
             logger.info("Loading %s (page %d, attempt %d/%d)",
                         url, page_num, attempt + 1, args.retries + 1)
@@ -428,6 +432,13 @@ async def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concur
 
             try:
                 products, ok, blocked, remote_err = await fetch_fn(page_num, worker_offset)
+            except proxy_meter.ProxyBudgetExceeded as e:
+                # One meter for every worker: the first page that meets the
+                # cap stops dispatch for all of them. Not recorded, so it is
+                # counted as unattempted.
+                logger.error("Page %d not fetched: %s.", page_num, e)
+                stop_event.set()
+                return
             except Exception as e:
                 logger.error("Worker raised while fetching page %d: %s",
                              page_num, redact_secret_patterns(str(e)))
@@ -485,10 +496,16 @@ async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
         return finish_without_fetch(
             args.out, stop_reason=refused.stop_reason,
             pages_requested=args.pages, url=args.url, started_at=started_at)
+    meter = proxy_meter.start(args, proxy_pool, remote=bool(args.cdp_endpoint))
 
     url_1 = page_url(args.url, 1)
-    (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
-        await _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0, cdp=cdp))
+    try:
+        (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
+            await _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0, cdp=cdp))
+    except proxy_meter.ProxyBudgetExceeded as e:
+        logger.error("Stopping: %s.", e)
+        (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = \
+            ([], False, False, False), False
 
     page_results = {1: products_1}
     failed_pages = [] if ok_1 else [1]
@@ -502,6 +519,11 @@ async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
     remaining_pages = list(range(2, args.pages + 1))
     if remaining_pages and not products_1 and not ok_1:
         logger.warning("Page 1 failed entirely -- not attempting pages 2..%d.", args.pages)
+        unattempted_pages = remaining_pages
+        remaining_pages = []
+    if remaining_pages and meter is not None and meter.exceeded:
+        logger.error("Stopping after page 1: the proxy budget is spent; pages "
+                     "2..%d are not requested.", args.pages)
         unattempted_pages = remaining_pages
         remaining_pages = []
 
@@ -525,6 +547,12 @@ async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
         # Pages left undispatched because a page added no new sku: the
         # listing ENDED, which is a complete answer, not a gap in one.
         exhausted_pages = more_unattempted
+        if meter is not None and meter.exceeded:
+            # ...unless the proxy budget stopped dispatch: then they were
+            # simply never asked for.
+            unattempted_pages = sorted(set(unattempted_pages)
+                                       | set(more_unattempted))
+            exhausted_pages = []
 
     all_products = [p for page_num in sorted(page_results) for p in page_results[page_num]]
     all_products = dedupe_by_sku(all_products)
@@ -537,6 +565,7 @@ async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
         started_at=started_at,
         exhausted_pages=exhausted_pages, url=args.url,
         parser_failed_pages=parser_failed_pages,
+        proxy=proxy_meter.finish(args),
     )
 
 
@@ -572,6 +601,7 @@ def parse_args():
     p.add_argument("--min-score", type=float, default=None,
                     help="Minimum acceptable reCAPTCHA v3 score to request from the solver")
     proxy_check.add_media_flags(p)
+    proxy_meter.add_budget_flag(p)
     p.add_argument("--cdp-endpoint", default=None,
                     help="Connect to an existing browser over CDP instead of launching pyppeteer's "
                          "bundled Chromium. Refused together with --proxy/--proxy-file (the remote "

@@ -33,6 +33,8 @@ py-modules = [
     "product_parser",
     "captcha_solver",
     "proxy_pool",
+    "proxy_check",
+    "proxy_meter",
     "fingerprint_client",
     "diff_runs",
     "scraper_api_client",

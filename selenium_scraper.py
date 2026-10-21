@@ -57,6 +57,7 @@ from output_writer import (
     PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, split_page_result,
 )
 import proxy_check
+import proxy_meter
 from env_config import (
     apply_env_defaults, non_negative_int, positive_int, non_negative_float,
     refuse_proxy_with_cdp_endpoint,
@@ -125,6 +126,10 @@ def build_driver(args, proxy_server_only: Optional[str] = None) -> webdriver.Chr
 
     if proxy_server_only:
         options.add_argument(f"--proxy-server={proxy_server_only}")
+    # The proxy meter reads chromedriver's performance log, which can only
+    # be asked for before the driver starts.
+    proxy_meter.selenium_options(
+        options, proxy_meter.of(args) if proxy_server_only else None)
 
     # Selenium Manager (built into selenium>=4.6) resolves a chromedriver
     # that matches the browser actually installed. webdriver-manager, used
@@ -133,6 +138,8 @@ def build_driver(args, proxy_server_only: Optional[str] = None) -> webdriver.Chr
     # every session died with "This version of ChromeDriver only supports
     # Chrome version 154" -- reported as exit 5 on every run.
     driver = webdriver.Chrome(options=options)
+    proxy_meter.install_selenium(
+        driver, proxy_meter.of(args) if proxy_server_only else None)
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     })
@@ -239,6 +246,8 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
     # every proxy rotation below (captcha_solver.SolveBudget).
     budget = SolveBudget()
     for attempt in range(args.retries + 1):
+        # Before a browser is even launched for this attempt.
+        proxy_meter.check(args)
         driver = None
         try:
             if current_exit and current_exit.auth_tuple():
@@ -264,6 +273,7 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                 wait_obj.until(lambda d: d.execute_script("return document.readyState") == "complete")
             except TimeoutException:
                 logger.error("Timeout loading %s.", url)
+                proxy_meter.drain_selenium(driver)
                 if args.cdp_endpoint:
                     driver.close()
                 else:
@@ -279,6 +289,8 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                            else _wait_for_listing_markers(driver))
 
             html = driver.page_source
+            # Everything the page loaded is in the performance log by now.
+            proxy_meter.drain_selenium(driver)
             products = parse_products(html, driver.current_url, category=args.category)
             logger.info("Parsed %d listing(s) from page %d.", len(products), page_num)
 
@@ -326,6 +338,7 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
         except Exception as e:
             error_msg = redact_secret_patterns(str(e))
             if driver:
+                proxy_meter.drain_selenium(driver)
                 try:
                     driver.quit()
                 except Exception:
@@ -388,6 +401,13 @@ def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency:
                 page_num = pending.pop(fut)
                 try:
                     products, ok, blocked, remote_err = fut.result()
+                except proxy_meter.ProxyBudgetExceeded as e:
+                    # One meter for every worker: the first page that meets
+                    # the cap stops dispatch for all of them.
+                    logger.error("Page %d not fetched: %s.", page_num, e)
+                    stop_event.set()
+                    unattempted_pages.append(page_num)
+                    continue
                 except Exception as e:
                     logger.error("Worker raised while fetching page %d: %s",
                                  page_num, redact_secret_patterns(str(e)))
@@ -430,10 +450,16 @@ def scrape(args) -> int:
         return finish_without_fetch(
             args.out, stop_reason=refused.stop_reason,
             pages_requested=args.pages, url=args.url, started_at=started_at)
+    meter = proxy_meter.start(args, proxy_pool, remote=bool(args.cdp_endpoint))
 
     url_1 = page_url(args.url, 1)
-    (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
-        _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0))
+    try:
+        (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
+            _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0))
+    except proxy_meter.ProxyBudgetExceeded as e:
+        logger.error("Stopping: %s.", e)
+        (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = \
+            ([], False, False, False), False
 
     page_results = {1: products_1}
     failed_pages = [] if ok_1 else [1]
@@ -447,6 +473,11 @@ def scrape(args) -> int:
     remaining_pages = list(range(2, args.pages + 1))
     if remaining_pages and not products_1 and not ok_1:
         logger.warning("Page 1 failed entirely -- not attempting pages 2..%d.", args.pages)
+        unattempted_pages = remaining_pages
+        remaining_pages = []
+    if remaining_pages and meter is not None and meter.exceeded:
+        logger.error("Stopping after page 1: the proxy budget is spent; pages "
+                     "2..%d are not requested.", args.pages)
         unattempted_pages = remaining_pages
         remaining_pages = []
 
@@ -470,6 +501,12 @@ def scrape(args) -> int:
         # Pages left undispatched because a page added no new sku: the
         # listing ENDED, which is a complete answer, not a gap in one.
         exhausted_pages = more_unattempted
+        if meter is not None and meter.exceeded:
+            # ...unless the proxy budget stopped dispatch: then they were
+            # simply never asked for.
+            unattempted_pages = sorted(set(unattempted_pages)
+                                       | set(more_unattempted))
+            exhausted_pages = []
 
     all_products = [p for page_num in sorted(page_results) for p in page_results[page_num]]
     all_products = dedupe_by_sku(all_products)
@@ -482,6 +519,7 @@ def scrape(args) -> int:
         started_at=started_at,
         exhausted_pages=exhausted_pages, url=args.url,
         parser_failed_pages=parser_failed_pages,
+        proxy=proxy_meter.finish(args),
     )
 
 
@@ -517,6 +555,7 @@ def parse_args():
     p.add_argument("--min-score", type=float, default=None,
                     help="Minimum acceptable reCAPTCHA v3 score to request from the solver")
     proxy_check.add_media_flags(p)
+    proxy_meter.add_budget_flag(p)
     p.add_argument("--cdp-endpoint", default=None,
                     help="BEST-EFFORT: attach via Selenium's debuggerAddress. Does NOT forward "
                          "URL-embedded credentials -- for an authenticated remote endpoint use "

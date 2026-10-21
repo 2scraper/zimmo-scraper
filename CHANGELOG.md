@@ -15,8 +15,35 @@ here rather than treated as a violation of the format.
 > (`status: failed`, `stop_reason: proxy_auth_failed` /
 > `proxy_balance_exhausted`) instead of timing out on every retry and
 > rotation. Runs without a proxy or over `--cdp-endpoint` are unchanged.
+>
+> **Behaviour change.** A run through a local proxy now **stops at 10 MB of
+> proxy traffic** by default (`--proxy-budget-mb`, `0` = no cap): it keeps
+> its rows and exits **6** (**5** with none) with `stop_reason:
+> proxy_budget_exceeded`, and it always writes
+> `<out>.latest_attempt.meta.json`.
 
 ### Added
+
+- `proxy_meter.py`: per-run proxy traffic meter and budget, in all three
+  engines, only through a local proxy. Playwright sums `request.sizes()`;
+  pyppeteer and Selenium count CDP `Network.loadingFinished.encodedDataLength`
+  plus each request's own size. Over budget, Playwright aborts new requests
+  in a route, pyppeteer/Selenium block every URL over CDP, and no further
+  page attempt starts a browser; `--concurrency` workers share one meter
+  and stop dispatching. `<out>.meta.json` and the attempt sidecar gain
+  `proxy_bytes`, `proxy_budget_bytes` and `proxy_budget_exceeded`; the log
+  ends with `Proxy traffic: X.X MB of Y MB budget`. `--proxy-budget-mb` and
+  `ZIMMO_PROXY_BUDGET_MB` (in `.env.example`).
+- CI only: the canary passes `--proxy-budget-mb 10`, writes the run's proxy
+  traffic to the step summary, and fails with
+  `::error::stopped: proxy budget 10 MB exceeded` when the cap was hit
+  (`.github/proxy_traffic.py`).
+- Offline checks: the meter against known CDP and Playwright sizes, an HTTP
+  client through a byte-counting stub proxy, the sidecars and exit codes
+  over budget, every engine driven past the budget (also with
+  `--concurrency 2`), the canary step and its summary script. An opt-in
+  real-browser check (`PROXY_METER_BROWSER=1`) compares each driver's count
+  with a stub proxy's.
 
 - `proxy_check.py`: the proxy pre-check (one CONNECT plus `HEAD /robots.txt`
   on www.zimmo.be, no third-party service), wired into all three engines
@@ -37,6 +64,8 @@ here rather than treated as a violation of the format.
 
 ### Changed
 
+- `pyproject.toml` lists `proxy_check` (missing since it was added) and
+  `proxy_meter` among the installed modules.
 - CI only: the canary bills the `ZIMMO_PROXY` exit, so its schedule is now
   weekly (Mondays 06:17 UTC) instead of daily; a manual dispatch, and a push that
   changes the canary file, still run it.
