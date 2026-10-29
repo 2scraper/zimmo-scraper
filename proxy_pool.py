@@ -23,6 +23,7 @@ Two fixes per external audit (2026-09-14, finding #4):
 import logging
 import random
 import re
+import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
@@ -79,20 +80,53 @@ class ProxyExit:
         return (self.username, self.password or "")
 
 
+# `host:port:user:pass`, optionally with a scheme in front: the form the
+# 2Captcha proxy dashboard hands out. Reported 2026-10-28: passed as
+# --proxy it raised a ValueError whose text held the password verbatim,
+# because the URL redaction above only knows `user:pass@`.
+_COLON_FORM_RE = re.compile(
+    r"^(?:(?P<scheme>[a-z][a-z0-9+.-]*)://)?(?P<host>[^:/@\s]+):(?P<port>\d{1,5})"
+    r":(?P<user>[^:@\s]+):(?P<password>[^@\s]+)$", re.IGNORECASE)
+
+
+def _bare_host(url: str) -> str:
+    """The host part of a proxy string, for an error message that must not
+    repeat the string itself (it can hold a password in any position)."""
+    rest = url.split("://", 1)[-1]
+    host = rest.rsplit("@", 1)[-1].split(":", 1)[0].split("/", 1)[0]
+    return host or "?"
+
+
+def normalize_proxy_url(url: str) -> str:
+    """`host:port:user:pass` -> `http://user:pass@host:port`; anything else
+    is returned unchanged."""
+    url = url.strip()
+    m = _COLON_FORM_RE.match(url)
+    if not m or "@" in url:
+        return url
+    return (f"{(m.group('scheme') or 'http').lower()}://{m.group('user')}:"
+            f"{m.group('password')}@{m.group('host')}:{m.group('port')}")
+
+
 def parse_proxy_url(url: str) -> ProxyExit:
-    parsed = urlparse(url)
-    if not parsed.hostname or not parsed.port:
-        # Redact BEFORE raising -- the raw url can carry a real
-        # username:password, and this exception's text is a log the
-        # moment anything catches and prints it.
+    url = normalize_proxy_url(url)
+    try:
+        parsed = urlparse(url)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        host = port = None
+    if not host or not port:
+        # Never quote the value: it can carry a password in a shape the
+        # redaction does not recognise. The host is enough to find it.
         raise ValueError(
-            f"Not a valid proxy URL (need scheme://host:port): {redact_secret_patterns(url)!r}"
+            f"Not a valid proxy (host {_bare_host(url)!r}): expected "
+            f"scheme://user:pass@host:port, scheme://host:port or host:port:user:pass"
         )
     return ProxyExit(
         raw_url=url,
-        scheme=parsed.scheme or "http",
-        host=parsed.hostname,
-        port=parsed.port,
+        scheme=(parsed.scheme or "http").lower(),
+        host=host,
+        port=port,
         username=parsed.username,
         password=parsed.password,
     )
@@ -105,11 +139,59 @@ def load_proxy_file(path: str) -> List[str]:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            urls.append(line)
+            urls.append(normalize_proxy_url(line))
+    return urls
+
+
+def proxy_urls_from_args(args) -> Optional[List[str]]:
+    """The run's proxy list from --proxy-file or --proxy, validated; None
+    without a proxy. Raises ValueError with a message safe to print (no
+    credential) for an unreadable or empty file, an unparseable entry, or a
+    SOCKS proxy with a login, which no engine here can use: Chromium does
+    not authenticate SOCKS (Playwright says so at launch, after the run has
+    already started)."""
+    if getattr(args, "proxy_file", None):
+        try:
+            urls = load_proxy_file(args.proxy_file)
+        except OSError as e:
+            raise ValueError(f"could not read --proxy-file {args.proxy_file!r}: "
+                             f"{e.strerror or type(e).__name__}") from None
+        except UnicodeDecodeError:
+            raise ValueError(f"--proxy-file {args.proxy_file!r} is not a UTF-8 text file") from None
+        if not urls:
+            raise ValueError(f"--proxy-file {args.proxy_file!r} holds no proxy "
+                             f"(only blank lines and # comments)")
+        where = "--proxy-file"
+    elif getattr(args, "proxy", None):
+        urls = [normalize_proxy_url(args.proxy)]
+        where = "--proxy / ZIMMO_PROXY"
+    else:
+        return None
+    for n, url in enumerate(urls, 1):
+        try:
+            exit_ = parse_proxy_url(url)
+        except ValueError as e:
+            raise ValueError(f"{where}, entry {n}: {e}") from None
+        if exit_.scheme.startswith("socks") and exit_.username:
+            raise ValueError(f"{where}, entry {n} ({exit_.masked()}): Chromium cannot "
+                             f"authenticate a SOCKS proxy; use its http:// endpoint")
     return urls
 
 
 class ProxyPool:
+    """Exit selection, measured against a three-exit pool on 2026-10-28
+    (good, silent, good): page 2 tried the silent exit twice and page 3
+    went back to the exit that had just failed, while the third, working
+    exit was never used. Now:
+
+    * an exit that reached --proxy-block-retries failures is retired and is
+      never handed out again, by get_exit_for_worker() either;
+    * among the rest, the exit with the FEWEST failures is chosen, so a page
+      starts on an exit that has not failed this run whenever one exists;
+    * rotate_away_from() never returns the exit that just failed while
+      another usable one exists.
+    """
+
     def __init__(self, urls: List[str], shuffle: bool = False, block_retries: int = 3):
         if not urls:
             raise ValueError("ProxyPool needs at least one proxy URL")
@@ -118,32 +200,103 @@ class ProxyPool:
             random.shuffle(exits)
         self._exits = exits
         self._block_retries = block_retries
+        self._lock = threading.Lock()
 
     def __len__(self) -> int:
         return len(self._exits)
 
-    def get_exit_for_worker(self, worker_offset: int) -> ProxyExit:
-        return self._exits[worker_offset % len(self._exits)]
+    def _usable(self) -> List[ProxyExit]:
+        return [e for e in self._exits if e.failure_count < self._block_retries]
+
+    def _pick(self, candidates: List[ProxyExit], worker_offset: int) -> ProxyExit:
+        fewest = min(e.failure_count for e in candidates)
+        best = [e for e in candidates if e.failure_count == fewest]
+        return best[worker_offset % len(best)]
+
+    def get_exit_for_worker(self, worker_offset: int) -> Optional[ProxyExit]:
+        """None once every exit is retired: the caller must then fail the
+        page, never fall back to a direct connection."""
+        with self._lock:
+            usable = self._usable()
+            return self._pick(usable, worker_offset) if usable else None
+
+    def retire(self, dead: ProxyExit) -> None:
+        """Take an exit out of the run for good (the pre-check's 407/402)."""
+        with self._lock:
+            dead.failure_count = max(dead.failure_count, self._block_retries)
 
     def rotate_away_from(self, dead: ProxyExit, worker_offset: int) -> Optional[ProxyExit]:
         """Called on EVERY failure of `dead` -- not just once its
         failure_count crosses --proxy-block-retries. That threshold now
         only controls when an exit is excluded from the pool ENTIRELY,
         not whether THIS retry gets a fresh exit."""
-        dead.failure_count += 1
-        if dead.failure_count >= self._block_retries:
-            logger.warning("proxy_pool: %s failed %d time(s) -- treating as blocked, "
-                            "will not be re-selected for this run.",
-                            dead.masked(), dead.failure_count)
+        with self._lock:
+            dead.failure_count += 1
+            if dead.failure_count >= self._block_retries:
+                logger.warning("proxy_pool: %s failed %d time(s) -- treating as blocked, "
+                                "will not be re-selected for this run.",
+                                dead.masked(), dead.failure_count)
 
-        candidates = [e for e in self._exits if e.failure_count < self._block_retries and e is not dead]
-        if not candidates:
-            if dead.failure_count < self._block_retries:
-                return dead
-            logger.error("proxy_pool: every exit in the pool has failed --block-retries "
-                          "times -- no exit left to rotate to.")
-            return None
-        return candidates[worker_offset % len(candidates)]
+            candidates = [e for e in self._usable() if e is not dead]
+            if not candidates:
+                if dead.failure_count < self._block_retries:
+                    return dead
+                logger.error("proxy_pool: every exit in the pool has failed --block-retries "
+                              "times -- no exit left to rotate to.")
+                return None
+            return self._pick(candidates, worker_offset)
+
+    def after_failure(self, failed: ProxyExit, worker_offset: int, rotate: bool,
+                      what: str, detail: str) -> Optional[ProxyExit]:
+        """Count one failure of `failed` (a proxy error, or a navigation that
+        timed out through it) and return the exit for the next attempt;
+        None when no usable exit is left. Logs ONE line saying what happens
+        next -- it used to say "rotating" and then, with --no-proxy-rotate,
+        "retrying the SAME exit" right after it."""
+        if not rotate:
+            with self._lock:
+                failed.failure_count += 1
+            logger.warning("%s on exit %s (%s) -- --no-proxy-rotate: retrying the same exit.",
+                           what, failed.masked(), detail)
+            return failed
+        nxt = self.rotate_away_from(failed, worker_offset)
+        if nxt is None:
+            logger.warning("%s on exit %s (%s) -- no usable exit left.", what, failed.masked(), detail)
+        elif nxt is failed:
+            logger.warning("%s on exit %s (%s) -- no other usable exit, retrying this one.",
+                           what, failed.masked(), detail)
+        else:
+            logger.warning("%s on exit %s (%s) -- rotating to %s.",
+                           what, failed.masked(), detail, nxt.masked())
+        return nxt
+
+
+class _LateConnectionErrorFilter(logging.Filter):
+    """asyncio reports a future nobody awaited -- a CDP connect abandoned
+    after its timeout, a browser connection closed under a callback -- with
+    a 20-line traceback when the object is collected, often after the run
+    has written its result (report of 2026-10-28: "Task exception was never
+    retrieved ... InvalidStatusCode" after a successful 63-row run). The
+    attempt it belonged to was already handled; keep one line, at DEBUG."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.msg)
+        if not ("exception was never retrieved" in msg or msg.startswith("Exception in callback")):
+            return True
+        exc = record.exc_info[1] if record.exc_info else None
+        record.msg = "Late error from an already-closed browser connection, ignored: %s"
+        record.args = (redact_secret_patterns(
+            f"{type(exc).__name__}: {exc}" if exc else msg.splitlines()[0])[:300],)
+        record.exc_info = None
+        record.exc_text = None
+        record.levelno, record.levelname = logging.DEBUG, "DEBUG"
+        return logging.getLogger().isEnabledFor(logging.DEBUG)
+
+
+def quiet_late_connection_errors() -> None:
+    log = logging.getLogger("asyncio")
+    if not any(isinstance(f, _LateConnectionErrorFilter) for f in log.filters):
+        log.addFilter(_LateConnectionErrorFilter())
 
 
 def is_proxy_error(error_message: str) -> bool:

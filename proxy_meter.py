@@ -415,10 +415,16 @@ SELENIUM_LOGGING_PREFS = {"performance": "ALL"}
 
 
 def selenium_options(options, meter: Optional[ProxyMeter]) -> None:
-    """Ask chromedriver for the performance log the meter reads."""
+    """Ask chromedriver for the performance log the meter reads, and return
+    from get() at DOMContentLoaded (as the other two engines navigate), so
+    the engine can read that log -- and block -- while the page's scripts
+    and images are still loading. With the default strategy get() returned
+    only once everything had loaded: measured 2026-10-28, a 0.1 MB budget
+    stopped at 4.6 MB on Selenium and at 0.2 MB on the other two."""
     if meter is None:
         return
     options.set_capability("goog:loggingPrefs", SELENIUM_LOGGING_PREFS)
+    options.page_load_strategy = "eager"
 
 
 def install_selenium(driver, meter: Optional[ProxyMeter]) -> None:
@@ -428,6 +434,9 @@ def install_selenium(driver, meter: Optional[ProxyMeter]) -> None:
     setattr(driver, "_proxy_meter_counter", counter)
 
     def _block():
+        # setBlockedURLs is part of the Network domain, which this session
+        # must have enabled for it to apply.
+        driver.execute_cdp_cmd("Network.enable", {})
         driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": ["*"]})
     meter.on_exceed(_block)
 

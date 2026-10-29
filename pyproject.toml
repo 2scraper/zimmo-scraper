@@ -19,7 +19,7 @@ dependencies = [
 # (CI installs only requirements.txt + one of these files
 # directly, not through these extras, so drift here would go unnoticed
 # by CI; check both whenever either changes).
-playwright = ["playwright>=1.44"]
+playwright = ["playwright==1.44.0"]
 puppeteer = ["pyppeteer>=2.0"]
 selenium = ["selenium>=4.20"]
 

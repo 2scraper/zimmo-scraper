@@ -15,28 +15,65 @@ and reports a listing missing from a newer run that read only a window of
 the listing (--pages ended before the listing did) as `left_selection`
 rather than `removed`.
 
+Either run may be the .json or the .csv output (`--format csv` writes no
+JSON); its sidecar is `<out>.meta.json` beside it either way.
+
 Usage:
     python3 diff_runs.py --old run1.json --new run2.json
-    python3 diff_runs.py --old run1.json --new run2.json --fail-on-change
+    python3 diff_runs.py --old run1.json --new run2.csv --fail-on-change
 """
 
 import argparse
+import csv
 import json
+import os
 import sys
 from typing import Dict, List, Optional
 
+# The CSV holds text; these columns are numbers in the JSON (output_writer.
+# Product). Read back as the same types, so a JSON run and a CSV run of the
+# same listings compare equal.
+_FLOAT_FIELDS = ("price", "original_price", "discount_pct", "surface_m2", "epc_value")
+_INT_FIELDS = ("bedrooms",)
+# output_writer prefixes a formula-shaped text cell with an apostrophe.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 
-def _load_meta(json_path: str) -> Optional[dict]:
-    meta_path = json_path.rsplit(".json", 1)[0] + ".meta.json"
+
+def _prefix(path: str) -> str:
+    for ext in (".json", ".csv"):
+        if path.endswith(ext):
+            return path[: -len(ext)]
+    return path
+
+
+def _meta_path(path: str) -> str:
+    return _prefix(path) + ".meta.json"
+
+
+def _load_meta(path: str) -> Optional[dict]:
     try:
-        with open(meta_path, "r", encoding="utf-8") as f:
+        with open(_meta_path(path), "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return None
 
 
-def _load_products(json_path: str) -> List[dict]:
-    with open(json_path, "r", encoding="utf-8") as f:
+def _csv_value(name: str, text: str):
+    if text == "":
+        return None
+    if name in _FLOAT_FIELDS:
+        return float(text)
+    if name in _INT_FIELDS:
+        return int(float(text))
+    if text.startswith("'") and text[1:].startswith(_FORMULA_PREFIXES):
+        return text[1:]
+    return text
+
+
+def _load_products(path: str) -> List[dict]:
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        if path.endswith(".csv"):
+            return [{k: _csv_value(k, v) for k, v in row.items()} for row in csv.DictReader(f)]
         return json.load(f)
 
 
@@ -127,8 +164,8 @@ def diff(old_products: List[dict], new_products: List[dict],
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--old", required=True, help="Path to the earlier run's .json output")
-    p.add_argument("--new", required=True, help="Path to the later run's .json output")
+    p.add_argument("--old", required=True, help="Path to the earlier run's .json or .csv output")
+    p.add_argument("--new", required=True, help="Path to the later run's .json or .csv output")
     p.add_argument("--fail-on-change", action="store_true",
                    help="Exit non-zero if anything actually changed (source_changed-only rows are ignored)")
     p.add_argument("--allow-selection-mismatch", action="store_true",
@@ -137,12 +174,19 @@ def main() -> int:
                         "searches, not changes on the site.")
     args = p.parse_args()
 
+    for path in (args.old, args.new):
+        if not os.path.isfile(path):
+            print(f"[!] {path}: no such file. Refusing to diff.")
+            return 2
+        if not path.endswith((".json", ".csv")):
+            print(f"[!] {path}: expected a run's .json or .csv output. Refusing to diff.")
+            return 2
     old_meta, new_meta = _load_meta(args.old), _load_meta(args.new)
     for label, meta, path in (("old", old_meta, args.old), ("new", new_meta, args.new)):
         if meta is None:
             print(f"[!] No .meta.json sidecar found next to {path} -- cannot confirm this "
                   f"run was 'complete'. Refusing to diff. (Looked for "
-                  f"{path.rsplit('.json', 1)[0]}.meta.json)")
+                  f"{_meta_path(path)})")
             return 2
         if meta.get("status") != "complete":
             print(f"[!] The '{label}' run's status is {meta.get('status')!r}, not 'complete' -- "

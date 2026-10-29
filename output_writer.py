@@ -109,6 +109,10 @@ EXIT_REMOTE_API_ERROR = 5
 # another.
 EXIT_FETCH_FAILED = EXIT_REMOTE_API_ERROR
 EXIT_PARTIAL = 6
+# Ctrl-C with nothing to save: the shell's own code for SIGINT, not 1
+# ("crash"). With rows, an interrupted run is written as partial, exit 6.
+EXIT_INTERRUPTED = 130
+STOP_INTERRUPTED = "interrupted"
 
 
 # --- What one fetched page turned out to be -------------------------------
@@ -123,11 +127,17 @@ EXIT_PARTIAL = 6
 #
 # Measured live 2026-10-07 through a residential exit: a served search page
 # is HTTP 200; Cloudflare's "Even geduld..." challenge is HTTP 403; a route
-# the site does not serve is HTTP 404 ("Pagina niet gevonden"); and a page
-# number past the end of the listing is HTTP 200 carrying page 1 again --
-# which the data-based "no new sku" rule, not the status, recognises.
+# the site does not serve is HTTP 404 ("Pagina niet gevonden").
+#
+# Measured 2026-10-28 (manual test report): a page number past the end of a
+# listing is NO LONGER page 1 again. It is HTTP 200 with the search's own
+# total ("51 resultaten") and no tile: "We vonden helaas geen resultaten".
+# And a page whose load was cut off (the proxy went away mid-page) was also
+# HTTP 200 with no tile, and read as an empty search. The site's own result
+# count (product_parser.parse_result_count) is what tells these apart.
 PAGE_CONTENT = "content"          # listings were parsed
-PAGE_EMPTY = "empty"              # served normally, no listings on it
+PAGE_EMPTY = "empty"              # served, the site counts 0 results for the search
+PAGE_PAST_END = "past_end"        # served, the site counts N > 0 results, none on this page
 PAGE_BLOCKED = "blocked"          # 401/403, or a challenge that never cleared
 PAGE_NOT_FOUND = "not_found"      # 404/410 -- retrying will not change it
 PAGE_FETCH_ERROR = "fetch_error"  # 429/5xx/other 4xx -- the content was never obtained
@@ -137,17 +147,30 @@ PAGE_FETCH_ERROR = "fetch_error"  # 429/5xx/other 4xx -- the content was never o
 # reporting it as an empty catalogue (exit 4) would tell a pipeline the
 # listings are gone when they are on the screen.
 PAGE_PARSER_FAILED = "parser_failed"
+# HTTP 200 with neither a listing nor the site's result count: the page
+# did not finish rendering. Not proof of an empty search.
+PAGE_INCOMPLETE = "incomplete"
 
 RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
+_NO_COUNT = object()
+
+
 def classify_page(products_found: int, http_status: Optional[int],
-                  challenge_detected: bool, rendered_ok: bool) -> str:
+                  challenge_detected: bool, rendered_ok: bool,
+                  result_count=_NO_COUNT) -> str:
     """Order matters: parsed listings win over everything (a challenge that
     the solver or the browser cleared after a 403 still yields a good
     page), then the status, then the challenge heuristic. `http_status` is
     None when the engine could not read it; the challenge heuristic is
-    then the only signal, exactly as before this fix."""
+    then the only signal, exactly as before this fix.
+
+    `result_count` is the search's total as the page states it (None when
+    the page states none). A served page without listings is then `empty`
+    (the site counts 0), `past_end` (it counts more than 0, so this page is
+    beyond the last one) or `incomplete` (no count: it never finished
+    rendering). Omitted, such a page is `empty`, as before."""
     if products_found:
         return PAGE_CONTENT
     if rendered_ok:
@@ -164,7 +187,11 @@ def classify_page(products_found: int, http_status: Optional[int],
         return PAGE_FETCH_ERROR
     if challenge_detected:
         return PAGE_BLOCKED
-    return PAGE_EMPTY
+    if result_count is _NO_COUNT or result_count == 0:
+        return PAGE_EMPTY
+    if result_count is None:
+        return PAGE_INCOMPLETE
+    return PAGE_PAST_END
 
 
 def status_rules_out_listings(http_status: Optional[int]) -> bool:
@@ -178,23 +205,71 @@ def status_rules_out_listings(http_status: Optional[int]) -> bool:
 def page_outcome_is_ok(outcome: str) -> bool:
     """True for a page whose answer can be trusted -- listings, or a page
     the site served normally with none on it."""
-    return outcome in (PAGE_CONTENT, PAGE_EMPTY)
+    return outcome in (PAGE_CONTENT, PAGE_EMPTY, PAGE_PAST_END)
 
 
 def should_retry_page(outcome: str, http_status: Optional[int]) -> bool:
     """Only a transient server answer earns another attempt. A block is
     not retried from the same exit (the next answer is the same 403), and
     a 404 is a fact about the URL."""
-    return outcome == PAGE_FETCH_ERROR and http_status in RETRYABLE_STATUSES
+    return ((outcome == PAGE_FETCH_ERROR and http_status in RETRYABLE_STATUSES)
+            or outcome == PAGE_INCOMPLETE)
 
 
-def split_page_result(result) -> Tuple[tuple, bool]:
+def split_page_result(result) -> Tuple[tuple, bool, Optional[int]]:
     """An engine's _fetch_page returns (products, ok, blocked,
-    remote_api_error, parser_failed); the page dispatchers only consume
-    the first four. Returns those four plus the parser-failure flag
-    (False for a four-element result)."""
+    remote_api_error, parser_failed, result_count); the page dispatchers
+    only consume the first four. Returns those four, the parser-failure
+    flag (False when absent) and the page's stated result count (None when
+    absent)."""
     result = tuple(result)
-    return result[:4], bool(result[4]) if len(result) > 4 else False
+    return (result[:4], bool(result[4]) if len(result) > 4 else False,
+            result[5] if len(result) > 5 else None)
+
+
+def is_last_page(products: List["Product"], first_page_size: int,
+                 result_count: Optional[int], seen_keys: int) -> bool:
+    """True when a page shows the listing is over, so no later page needs
+    asking for: it was served with no listing (past the end), or the run
+    now holds every result the site counts AND this page was shorter than
+    page 1 (a short page alone can be a dedupe artefact, a count alone can
+    include what the grid does not show)."""
+    if not products:
+        return True
+    return (result_count is not None and seen_keys >= result_count
+            and len(products) < first_page_size)
+
+
+_interrupt_seen = False
+
+
+def install_interrupt_flag() -> None:
+    """For the synchronous engines: Ctrl-C still raises KeyboardInterrupt,
+    and also leaves a flag, because the browser dies with the same signal
+    and the error that surfaces first can be the driver's own ("Target
+    closed"), caught by a retry loop as an ordinary failure."""
+    import signal
+
+    def _handler(signum, frame):
+        global _interrupt_seen
+        _interrupt_seen = True
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, _handler)
+
+
+def interrupt_seen() -> bool:
+    return _interrupt_seen
+
+
+class RunInterrupted(Exception):
+    """Ctrl-C while pages were being fetched: carries what the page
+    dispatcher had gathered, so the run can still be written as partial."""
+
+    def __init__(self, page_results, failed_pages, any_blocked, any_remote_error,
+                 unattempted_pages):
+        super().__init__("interrupted")
+        self.partial = (page_results, failed_pages, any_blocked, any_remote_error,
+                        unattempted_pages)
 
 
 def selection_url(url: str) -> str:
@@ -367,6 +442,8 @@ def finish_run(
     url: Optional[str] = None,
     parser_failed_pages: Optional[List[int]] = None,
     proxy: Optional[Dict[str, Any]] = None,
+    listing_end_seen: bool = False,
+    interrupted: bool = False,
 ) -> int:
     """`proxy` is the proxy meter's record (proxy_meter.ProxyMeter.sidecar)
     on a run through a local proxy, None otherwise. When present it goes
@@ -382,16 +459,18 @@ def finish_run(
         unattempted_pages=unattempted_pages, blocked=blocked,
         remote_api_error=remote_api_error, allow_empty=allow_empty,
         started_at=started_at, exhausted_pages=exhausted_pages, url=url,
-        parser_failed_pages=parser_failed_pages, proxy=proxy)
-    if proxy is not None:
+        parser_failed_pages=parser_failed_pages, proxy=proxy,
+        listing_end_seen=listing_end_seen, interrupted=interrupted)
+    if proxy is not None or (interrupted and meta is None):
         if meta is None:
             # Nothing was written; record the attempt without touching any
             # previous output or its .meta.json.
             meta = {
                 "status": "blocked" if rc == EXIT_BLOCKED else (
                     "empty" if rc == EXIT_ZERO_PRODUCTS else "failed"),
-                "stop_reason": (STOP_PROXY_BUDGET_EXCEEDED
-                                if proxy.get("proxy_budget_exceeded") else
+                "stop_reason": (STOP_INTERRUPTED if interrupted else
+                                STOP_PROXY_BUDGET_EXCEEDED
+                                if (proxy or {}).get("proxy_budget_exceeded") else
                                 {EXIT_BLOCKED: "blocked",
                                  EXIT_ZERO_PRODUCTS: "zero products"}.get(
                                      rc, "content not obtained")),
@@ -407,7 +486,7 @@ def finish_run(
                 "started_at": started_at,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "source": "zimmo.be",
-                **proxy,
+                **(proxy or {}),
             }
         write_attempt_meta(meta, out_prefix)
     return rc
@@ -430,7 +509,8 @@ def write_attempt_meta(meta: Dict[str, Any], out_prefix: str) -> str:
 def _finish_run(products, out_prefix, fmt, *, pages_requested, pages_completed,
                 failed_pages, unattempted_pages, blocked, remote_api_error,
                 allow_empty, started_at, exhausted_pages, url,
-                parser_failed_pages, proxy):
+                parser_failed_pages, proxy, listing_end_seen=False,
+                interrupted=False):
     """The single place that decides status, exit code, and whether/what
     to write.
 
@@ -470,10 +550,18 @@ def _finish_run(products, out_prefix, fmt, *, pages_requested, pages_completed,
     failed_pages = sorted(set(failed_pages) | set(parser_failed_pages))
     finished_at = datetime.now(timezone.utc).isoformat()
     budget_stop = bool(proxy and proxy.get("proxy_budget_exceeded"))
+    if interrupted:
+        exhausted_pages = []
+        listing_end_seen = False
+        if not products:
+            print("[!] Interrupted (Ctrl-C) before any listing was recovered -- writing "
+                  "nothing, leaving any previous good output in place.")
+            return EXIT_INTERRUPTED, None
     if budget_stop:
         # The requests after the cap were refused, so the run cannot have
         # seen the end of the listing, nor a block or an empty search.
         exhausted_pages = []
+        listing_end_seen = False
         if not products:
             print("[!] Proxy budget exceeded before any listing was recovered "
                   "(proxy_budget_exceeded) -- the content was never obtained. "
@@ -481,8 +569,11 @@ def _finish_run(products, out_prefix, fmt, *, pages_requested, pages_completed,
             return EXIT_FETCH_FAILED, None
 
     if remote_api_error and not products:
-        print("[!] Remote API error and zero products recovered -- writing nothing, "
-              "leaving any previous good output in place.")
+        # Not "Remote API error": the same flag covers a local browser that
+        # never started and a proxy that died, which no remote API was
+        # involved in (report of 2026-10-28). The log above names the cause.
+        print("[!] Every attempt failed (see the errors above) and zero products were "
+              "recovered -- writing nothing, leaving any previous good output in place.")
         return EXIT_REMOTE_API_ERROR, None
 
     if blocked and not products:
@@ -515,7 +606,11 @@ def _finish_run(products, out_prefix, fmt, *, pages_requested, pages_completed,
               f"run. Pass --allow-empty to force writing an empty result.")
         return EXIT_ZERO_PRODUCTS, None
 
-    if budget_stop:
+    if interrupted:
+        status = "partial"
+        stop_reason = STOP_INTERRUPTED
+        exit_code = EXIT_PARTIAL
+    elif budget_stop:
         status = "partial"
         stop_reason = STOP_PROXY_BUDGET_EXCEEDED
         exit_code = EXIT_PARTIAL
@@ -543,8 +638,12 @@ def _finish_run(products, out_prefix, fmt, *, pages_requested, pages_completed,
         exit_code = EXIT_OK
     elif exhausted_pages:
         status = "complete"
-        stop_reason = (f"listing exhausted: page {min(exhausted_pages) - 1} added no new "
-                       f"listing, so pages {exhausted_pages} were not requested")
+        stop_reason = (f"listing exhausted: page {min(exhausted_pages) - 1} was the last "
+                       f"page of the listing, so pages {exhausted_pages} were not requested")
+        exit_code = EXIT_OK
+    elif listing_end_seen:
+        status = "complete"
+        stop_reason = "listing exhausted: the last requested page reached its end"
         exit_code = EXIT_OK
     else:
         status = "complete"
@@ -561,7 +660,7 @@ def _finish_run(products, out_prefix, fmt, *, pages_requested, pages_completed,
         "parser_failed_pages": parser_failed_pages,
         "unattempted_pages": unattempted_pages,
         "exhausted_pages": exhausted_pages,
-        "listing_exhausted": bool(exhausted_pages),
+        "listing_exhausted": bool(exhausted_pages) or listing_end_seen,
         "selection": {"url": selection_url(url) if url else None,
                       "pages_requested": pages_requested},
         "product_count": len(products),

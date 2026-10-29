@@ -215,8 +215,8 @@ def _pyppeteer(monkeypatch, remote):
     except ImportError as e:
         pytest.skip(f"pyppeteer unavailable: {e}")
 
-    async def connect(browserWSEndpoint):
-        assert browserWSEndpoint == ENDPOINT
+    async def connect(endpoint):
+        assert endpoint == ENDPOINT
         if remote.fail_connects:
             remote.fail_connects -= 1
             raise RuntimeError("server rejected WebSocket connection: HTTP 500")
@@ -230,7 +230,7 @@ def _pyppeteer(monkeypatch, remote):
             return None
         return types.SimpleNamespace(newPage=new_page, disconnect=disconnect)
 
-    monkeypatch.setattr(mod, "connect", connect)
+    monkeypatch.setattr(mod, "_connect_cdp", connect)
     return mod
 
 

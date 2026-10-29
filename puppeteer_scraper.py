@@ -24,40 +24,45 @@ Requires: pip install pyppeteer beautifulsoup4 requests --break-system-packages
 
 import argparse
 import asyncio
+import json
 import logging
+import re
 import sys
 import time
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 
-from pyppeteer import launch, connect
+from pyppeteer import launch
+from pyppeteer.browser import Browser
+from pyppeteer.connection import Connection
 
 from captcha_solver import (
     detect_recaptcha_v3, solve_recaptcha_v3, detect_cloudflare_challenge,
     detect_turnstile_challenge, solve_turnstile, SolveBudget,
     INJECT_TOKEN_JS, INJECT_TURNSTILE_TOKEN_JS,
 )
-from product_parser import parse_products, SELECTORS
+from product_parser import parse_products, parse_result_count, SELECTORS, NO_RESULTS_TEXTS
 from output_writer import (
-    Product, finish_run, finish_without_fetch, dedupe_by_sku, EXIT_CRASH,
+    Product, finish_run, finish_without_fetch, dedupe_by_sku, EXIT_INTERRUPTED,
     classify_page, page_outcome_is_ok, should_retry_page, status_rules_out_listings,
     PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, split_page_result,
+    is_last_page, RunInterrupted,
 )
 import proxy_check
 import proxy_meter
 from env_config import (
     apply_env_defaults, non_negative_int, positive_int, non_negative_float,
-    refuse_proxy_with_cdp_endpoint,
+    recaptcha_score, validate_run_args,
 )
 from proxy_pool import (
-    ProxyPool, load_proxy_file, is_proxy_error,
-    warn_if_concurrency_without_pool, refuse_concurrency_with_cdp_endpoint,
-    redact_secret_patterns,
+    ProxyPool, is_proxy_error, warn_if_concurrency_without_pool,
+    redact_secret_patterns, quiet_late_connection_errors, proxy_urls_from_args,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("puppeteer_scraper")
+quiet_late_connection_errors()
 
 ITEM_LINK_SELECTOR = SELECTORS["item_link"]
 MIN_CARD_MATCHES = 5
@@ -77,6 +82,44 @@ async def _bounded(awaitable, seconds: float, what: str):
         return await asyncio.wait_for(awaitable, seconds)
     except asyncio.TimeoutError:
         raise TimeoutError(f"{what} did not answer within {seconds:.0f}s") from None
+
+
+class CdpRefused(RuntimeError):
+    """The endpoint answered the websocket upgrade with an HTTP error."""
+
+
+async def _connect_cdp(endpoint: str, timeout_s: float = CDP_CALL_TIMEOUT_S):
+    """pyppeteer.connect(), watching the websocket handshake.
+
+    pyppeteer's connect() opens the websocket in a background task and then
+    waits for an answer that a refused handshake never sends: a wrong
+    Scraping Browser password (HTTP 401) cost three 60-second "did not
+    answer" timeouts, with the 401 visible only in a traceback printed
+    later (report of 2026-10-28, #29). Same steps as pyppeteer 2.0's
+    connect(), except that the handshake's own failure is raised at once."""
+    loop = asyncio.get_event_loop()
+    connection = Connection(endpoint, loop, 0)
+    recv = connection._recv_fut
+    deadline = loop.time() + timeout_s
+    # Not connection.send() before the socket is open: its sender task
+    # polls for the connection with no timeout of its own.
+    while not connection._connected and not recv.done():
+        if loop.time() > deadline:
+            recv.cancel()
+            raise TimeoutError(f"CDP connect did not answer within {timeout_s:.0f}s")
+        await asyncio.sleep(0.05)
+    if recv.done():
+        error = None if recv.cancelled() else recv.exception()
+        status = getattr(error, "status_code", None) or getattr(
+            getattr(error, "response", None), "status_code", None)
+        raise CdpRefused(f"the CDP endpoint refused the connection"
+                         f"{f' (HTTP {status})' if status else ''}: "
+                         f"{redact_secret_patterns(str(error))[:200]}")
+    contexts = await _bounded(connection.send("Target.getBrowserContexts"),
+                              max(1.0, deadline - loop.time()), "CDP connect")
+    return await Browser.create(connection, (contexts or {}).get("browserContextIds", []),
+                                False, {"width": 800, "height": 600}, None,
+                                lambda: connection.send("Browser.close"))
 
 
 
@@ -191,14 +234,23 @@ async def handle_captcha_if_present(page, args, budget: SolveBudget) -> bool:
     return detected_anything
 
 
+# Truthy once the grid has rendered ("listings") or the page says it has
+# none ("none"), so a page past the end of a listing does not wait 45 s.
+_READY_JS = (
+    "() => document.querySelectorAll(%s).length > %d ? 'listings' : "
+    "(document.body && %s.some(t => document.body.innerText.includes(t)) ? 'none' : false)"
+    % (json.dumps(ITEM_LINK_SELECTOR), MIN_CARD_MATCHES, json.dumps(list(NO_RESULTS_TEXTS))))
+
+
 async def _wait_for_listing_markers(page, timeout_ms: int = 45000) -> bool:
     for attempt in range(2):
         start = time.monotonic()
         try:
-            await page.waitForFunction(
-                f"document.querySelectorAll('{ITEM_LINK_SELECTOR}').length > {MIN_CARD_MATCHES}",
-                {"timeout": timeout_ms},
-            )
+            handle = await page.waitForFunction(_READY_JS, {"timeout": timeout_ms,
+                                                            "polling": 500})
+            if handle is not None and await handle.jsonValue() == "none":
+                logger.info("The page says it has no listing.")
+                return False
             await asyncio.sleep(1)
             return True
         except Exception as e:
@@ -229,8 +281,7 @@ class CdpConnection:
         if self._browser is None:
             logger.info("Connecting to existing browser over CDP: %s (one connection for the run)",
                         _mask_credentials(self.endpoint))
-            self._browser = await _bounded(connect(browserWSEndpoint=self.endpoint),
-                                           CDP_CALL_TIMEOUT_S, "CDP connect")
+            self._browser = await _connect_cdp(self.endpoint)
             self.connects += 1
         return self._browser
 
@@ -276,8 +327,24 @@ async def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyP
             await own_cdp.reset()
 
 
+# A local browser that never started is not worth a retry. Measured
+# 2026-10-28 on Apple Silicon: pyppeteer's x86_64 Chromium 117 crashes at
+# once headless under Rosetta ("Browser closed unexpectedly"), and the run
+# retried it and then reported a remote API error (#33).
+_LAUNCH_FAILURE_RE = re.compile(r"Browser closed unexpectedly|Failed to launch|"
+                                r"No such file or directory.*chrom", re.IGNORECASE)
+
+
+def _is_timeout(e: BaseException) -> bool:
+    return isinstance(e, (TimeoutError, asyncio.TimeoutError)) or type(e).__name__ == "TimeoutError"
+
+
 async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, cdp):
     current_exit = proxy_pool.get_exit_for_worker(worker_offset) if proxy_pool else None
+    if proxy_pool and current_exit is None:
+        logger.error("Page %d: every proxy exit is retired for this run -- not fetching it "
+                     "without a proxy.", page_num)
+        return [], False, False, True
 
     # One paid-solve allowance for this page, shared by every attempt and
     # every proxy rotation below (captcha_solver.SolveBudget).
@@ -294,6 +361,16 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
                 launch_args = {
                     "headless": args.headless,
                     "args": ["--disable-blink-features=AutomationControlled", "--window-size=1366,900"],
+                    # pyppeteer's own SIGINT handler replaced Python's and
+                    # ran the event loop re-entrantly: Ctrl-C ended in a
+                    # traceback, exit 1, with the pages already fetched
+                    # lost (#8). Chromium gets the terminal's SIGINT anyway.
+                    "handleSIGINT": False, "handleSIGTERM": False, "handleSIGHUP": False,
+                    # Its atexit hook runs the event loop after asyncio.run
+                    # has closed it ("RuntimeError: Event loop is closed" at
+                    # the end of the log, #33); this loop closes the browser
+                    # itself, on every path.
+                    "autoClose": False,
                 }
                 if current_exit:
                     # Credentials never reach argv: only
@@ -317,12 +394,20 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
             response = await page.goto(url, {"waitUntil": "domcontentloaded", "timeout": 60000})
             http_status = response.status if response else None
 
-            detected = await handle_captcha_if_present(page, args, budget)
+            # The page renders (or clears a challenge by itself) before a
+            # challenge is looked for or a solve bought -- the same order
+            # in every engine (#4).
             rendered_ok = (False if status_rules_out_listings(http_status)
                            else await _wait_for_listing_markers(page))
+            solves_before = budget.used
+            detected = await handle_captcha_if_present(page, args, budget)
+            if (budget.used > solves_before and not rendered_ok
+                    and not status_rules_out_listings(http_status)):
+                rendered_ok = await _wait_for_listing_markers(page)
 
             html = await page.content()
             products = parse_products(html, page.url, category=args.category)
+            result_count = parse_result_count(html)
             logger.info("Parsed %d listing(s) from page %d.", len(products), page_num)
 
             if args.dump_html:
@@ -352,10 +437,13 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
 
             # FIXED (external audit, 2026-10-07, P1/P2): see
             # output_writer.classify_page() -- shared by all three engines.
-            outcome = classify_page(len(products), http_status, detected, rendered_ok)
+            outcome = classify_page(len(products), http_status, detected, rendered_ok,
+                                    result_count)
             if outcome != PAGE_CONTENT:
-                logger.warning("Page %d: HTTP %s, classified as %s.",
-                                page_num, http_status, outcome)
+                logger.warning("Page %d: HTTP %s, %s, classified as %s.",
+                                page_num, http_status,
+                                "no result count on the page" if result_count is None
+                                else f"the site counts {result_count} result(s)", outcome)
             if should_retry_page(outcome, http_status) and attempt < args.retries:
                 await asyncio.sleep(args.retry_delay)
                 continue
@@ -364,7 +452,17 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
             if ok and args.delay > 0:
                 await asyncio.sleep(args.delay)
 
-            return products, ok, outcome == PAGE_BLOCKED, False, outcome == PAGE_PARSER_FAILED
+            return (products, ok, outcome == PAGE_BLOCKED, False,
+                    outcome == PAGE_PARSER_FAILED, result_count)
+
+        except asyncio.CancelledError:
+            # Ctrl-C: close what this attempt opened, then let it through.
+            if browser is not None:
+                try:
+                    await _bounded(browser.close(), 10, "browser.close()")
+                except BaseException:
+                    pass
+            raise
 
         except Exception as e:
             error_msg = redact_secret_patterns(str(e))
@@ -382,17 +480,32 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
                     await browser.close()
                 except Exception:
                     pass
-            if is_proxy_error(error_msg) and proxy_pool:
-                logger.warning("Proxy error on exit %s (%s) -- rotating to a different exit.",
-                                current_exit.masked() if current_exit else "?", error_msg)
-                if args.proxy_rotate:
-                    next_exit = proxy_pool.rotate_away_from(current_exit, worker_offset)
-                    if next_exit is None:
-                        return [], False, False, True
-                    current_exit = next_exit
-                else:
-                    logger.info("--no-proxy-rotate is set -- retrying the SAME exit rather "
-                                "than rotating away from it.")
+            if isinstance(e, CdpRefused):
+                if "401" in error_msg:
+                    logger.error("The Scraping Browser refused the login in --cdp-endpoint / "
+                                 "ZIMMO_CDP_ENDPOINT (HTTP 401): check that endpoint's login "
+                                 "and password. Not retrying.")
+                    return [], False, False, True
+                logger.error("Error fetching page %d (attempt %d/%d): %s",
+                             page_num, attempt + 1, args.retries + 1, error_msg)
+                if attempt < args.retries:
+                    await asyncio.sleep(args.retry_delay)
+                    continue
+                return [], False, False, True
+            if not cdp and browser is None and _LAUNCH_FAILURE_RE.search(error_msg):
+                logger.error("The local Chromium did not start, so nothing was fetched -- not "
+                             "retrying (%s). pyppeteer downloads an x86_64 Chromium, which on "
+                             "Apple Silicon crashes headless under Rosetta: try --headful or "
+                             "playwright_scraper.py.", error_msg.splitlines()[0][:200])
+                return [], False, False, True
+            if proxy_pool and current_exit and (is_proxy_error(error_msg) or _is_timeout(e)):
+                # A navigation that times out through a proxy is that exit
+                # failing too (#26).
+                current_exit = proxy_pool.after_failure(
+                    current_exit, worker_offset, args.proxy_rotate,
+                    "Timeout" if _is_timeout(e) else "Proxy error", error_msg)
+                if current_exit is None:
+                    return [], False, False, True
                 continue
             logger.error("Error fetching page %d (attempt %d/%d): %s",
                          page_num, attempt + 1, args.retries + 1, error_msg)
@@ -404,8 +517,19 @@ async def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, c
     return [], False, False, False
 
 
+def _uncancel() -> None:
+    """Ctrl-C under asyncio.run (Python 3.11+) cancels the main task; once
+    that is caught to write the partial run, the task stops counting as
+    cancelled so the remaining awaits (closing the CDP connection) run."""
+    task = asyncio.current_task()
+    if task is not None and hasattr(task, "uncancel"):
+        while task.uncancel() > 0:
+            pass
+
+
 async def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency: int,
-                                     seen_skus_initial=()) -> Tuple[dict, List[int], bool, bool, List[int]]:
+                                     seen_skus_initial=(), last_page=None
+                                     ) -> Tuple[dict, List[int], bool, bool, List[int]]:
     """asyncio equivalent of playwright_scraper.py's own
     `_fetch_pages_concurrently` -- same contract, same
     data-based termination, reimplemented as a small worker-pool
@@ -456,10 +580,19 @@ async def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concur
                     logger.info("Page %d added no new sku -- listing appears exhausted, "
                                 "not requesting any later page.", page_num)
                     stop_event.set()
+                elif last_page is not None and last_page(page_num, products, seen_skus):
+                    logger.info("Page %d is the last page of the listing -- not requesting "
+                                "any later page.", page_num)
+                    stop_event.set()
             else:
                 failed_pages.append(page_num)
 
-    await asyncio.gather(*(worker(i) for i in range(workers)))
+    try:
+        await asyncio.gather(*(worker(i) for i in range(workers)))
+    except asyncio.CancelledError:
+        _uncancel()
+        raise RunInterrupted(page_results, failed_pages, any_blocked, any_remote_error,
+                             [p for p in remaining_pages if p not in page_results]) from None
 
     unattempted_pages = [p for p in remaining_pages if p not in page_results]
     return page_results, failed_pages, any_blocked, any_remote_error, unattempted_pages
@@ -478,37 +611,34 @@ async def scrape_async(args) -> int:
 async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
     started_at = datetime.now(timezone.utc).isoformat()
 
-    proxy_pool = None
-    if args.proxy_file:
-        urls = load_proxy_file(args.proxy_file)
-        proxy_pool = ProxyPool(urls, shuffle=args.proxy_shuffle, block_retries=args.proxy_block_retries)
-    elif args.proxy:
-        proxy_pool = ProxyPool([args.proxy], block_retries=args.proxy_block_retries)
-
-    warn_if_concurrency_without_pool(args.concurrency, proxy_pool)
-    refuse_concurrency_with_cdp_endpoint(args.concurrency, args.cdp_endpoint)
-
-    # One request through the proxy before a browser exists: a 407 or 402
-    # from the gateway ends the run here, in seconds, instead of surfacing
-    # as a navigation timeout after every retry.
-    refused = proxy_check.gate(proxy_pool, args.url)
+    proxy_pool, refused = _proxy_pool(args)
     if refused:
         return finish_without_fetch(
             args.out, stop_reason=refused.stop_reason,
             pages_requested=args.pages, url=args.url, started_at=started_at)
     meter = proxy_meter.start(args, proxy_pool, remote=bool(args.cdp_endpoint))
 
+    interrupted = False
+    result_counts: dict = {}
+
     url_1 = page_url(args.url, 1)
     try:
-        (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
-            await _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0, cdp=cdp))
+        (products_1, ok_1, blocked_1, remote_1), parser_failed_1, result_counts[1] = \
+            split_page_result(await _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0,
+                                                cdp=cdp))
     except proxy_meter.ProxyBudgetExceeded as e:
         logger.error("Stopping: %s.", e)
         (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = \
             ([], False, False, False), False
+    except asyncio.CancelledError:
+        _uncancel()
+        logger.warning("Interrupted (Ctrl-C) while fetching page 1.")
+        (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = \
+            ([], False, False, False), False
+        interrupted = True
 
     page_results = {1: products_1}
-    failed_pages = [] if ok_1 else [1]
+    failed_pages = [] if ok_1 or interrupted else [1]
     any_blocked = blocked_1
     any_remote_error = remote_1
     pages_completed = 1 if ok_1 else 0
@@ -517,6 +647,9 @@ async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
     exhausted_pages: List[int] = []
 
     remaining_pages = list(range(2, args.pages + 1))
+    if interrupted:
+        unattempted_pages = list(range(1, args.pages + 1))
+        remaining_pages = []
     if remaining_pages and not products_1 and not ok_1:
         logger.warning("Page 1 failed entirely -- not attempting pages 2..%d.", args.pages)
         unattempted_pages = remaining_pages
@@ -526,30 +659,46 @@ async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
                      "2..%d are not requested.", args.pages)
         unattempted_pages = remaining_pages
         remaining_pages = []
+    if remaining_pages and ok_1 and is_last_page(products_1, len(products_1), result_counts[1],
+                                                 len({p.sku for p in products_1 if p.sku})):
+        logger.info("Page 1 holds every result the site counts (%s) -- not requesting "
+                    "pages 2..%d.", result_counts[1], args.pages)
+        exhausted_pages = remaining_pages
+        remaining_pages = []
 
     if remaining_pages:
         async def fetch_fn(page_num, worker_offset):
             url = page_url(args.url, page_num)
-            result, parser_failed = split_page_result(
+            result, parser_failed, result_counts[page_num] = split_page_result(
                 await _fetch_page(url, page_num, args, proxy_pool, worker_offset, cdp=cdp))
             if parser_failed:
                 parser_failed_pages.append(page_num)
             return result
 
+        def last_page(page_num, products, seen_skus):
+            return is_last_page(products, len(products_1), result_counts.get(page_num),
+                                len(seen_skus))
+
         initial_skus = {p.sku for p in products_1 if p.sku}
-        more_results, more_failed, more_blocked, more_remote, more_unattempted = \
-            await _fetch_pages_concurrently(fetch_fn, remaining_pages, args.concurrency, initial_skus)
+        try:
+            more_results, more_failed, more_blocked, more_remote, more_unattempted = \
+                await _fetch_pages_concurrently(fetch_fn, remaining_pages, args.concurrency,
+                                                initial_skus, last_page=last_page)
+        except RunInterrupted as e:
+            logger.warning("Interrupted (Ctrl-C): keeping the pages already fetched.")
+            more_results, more_failed, more_blocked, more_remote, more_unattempted = e.partial
+            interrupted = True
         page_results.update(more_results)
         failed_pages.extend(more_failed)
         any_blocked = any_blocked or more_blocked
         any_remote_error = any_remote_error or more_remote
         pages_completed += len(more_results) - len(more_failed)
-        # Pages left undispatched because a page added no new sku: the
-        # listing ENDED, which is a complete answer, not a gap in one.
+        # Pages left undispatched because the listing ENDED: a complete
+        # answer, not a gap in one.
         exhausted_pages = more_unattempted
-        if meter is not None and meter.exceeded:
-            # ...unless the proxy budget stopped dispatch: then they were
-            # simply never asked for.
+        if interrupted or (meter is not None and meter.exceeded):
+            # ...unless Ctrl-C or the proxy budget stopped dispatch: then
+            # they were simply never asked for.
             unattempted_pages = sorted(set(unattempted_pages)
                                        | set(more_unattempted))
             exhausted_pages = []
@@ -566,7 +715,38 @@ async def _scrape_async(args, cdp: Optional[CdpConnection]) -> int:
         exhausted_pages=exhausted_pages, url=args.url,
         parser_failed_pages=parser_failed_pages,
         proxy=proxy_meter.finish(args),
+        listing_end_seen=_listing_end_seen(page_results, failed_pages, result_counts,
+                                           len(products_1)),
+        interrupted=interrupted,
     )
+
+
+def _listing_end_seen(page_results, failed_pages, result_counts, first_page_size) -> bool:
+    """See playwright_scraper.py's own copy."""
+    seen = set()
+    for page_num in sorted(page_results):
+        products = page_results[page_num]
+        seen |= {p.sku for p in products if p.sku}
+        if page_num in failed_pages:
+            continue
+        if page_num > 1 and is_last_page(products, first_page_size,
+                                         result_counts.get(page_num), len(seen)):
+            return True
+    return False
+
+
+def _proxy_pool(args):
+    """See playwright_scraper.py's own copy: every exit is pre-checked."""
+    urls = getattr(args, "proxy_urls", None)
+    if urls is None:
+        urls = proxy_urls_from_args(args)   # args not built by parse_args()
+    if not urls:
+        return None, None
+    pool = ProxyPool(urls, shuffle=args.proxy_shuffle, block_retries=args.proxy_block_retries)
+    # One request through the proxy before a browser exists: a 407 or 402
+    # from the gateway ends the run here, in seconds, instead of surfacing
+    # as a navigation timeout after every retry.
+    return pool, proxy_check.gate(pool, args.url)
 
 
 def parse_args():
@@ -598,7 +778,7 @@ def parse_args():
                     help="Treat a proxy exit as blocked after this many failures")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
     p.add_argument("--solve-captcha", choices=["always", "when-blocked", "never"], default="when-blocked")
-    p.add_argument("--min-score", type=float, default=None,
+    p.add_argument("--min-score", type=recaptcha_score, default=None,
                     help="Minimum acceptable reCAPTCHA v3 score to request from the solver")
     proxy_check.add_media_flags(p)
     proxy_meter.add_budget_flag(p)
@@ -615,9 +795,9 @@ def parse_args():
     args = p.parse_args()
 
     apply_env_defaults(args)
-    if not args.url:
-        p.error("--url is required (or set ZIMMO_URL in .env)")
-    refuse_proxy_with_cdp_endpoint(p, args)
+    validate_run_args(p, args)
+    if not args.proxy_urls:
+        warn_if_concurrency_without_pool(args.concurrency, None)
     return args
 
 
@@ -626,4 +806,6 @@ if __name__ == "__main__":
     try:
         sys.exit(asyncio.run(scrape_async(args)))
     except KeyboardInterrupt:
-        sys.exit(EXIT_CRASH)
+        # Python 3.9/3.10, or a Ctrl-C outside the page loop: nothing more to
+        # save. Not exit 1 ("crash").
+        sys.exit(EXIT_INTERRUPTED)

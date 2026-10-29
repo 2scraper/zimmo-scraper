@@ -48,7 +48,7 @@ jobs:
           playwright install --with-deps chromium
           sudo apt-get install -y xvfb
 
-      - name: Run against a known-good filtered category, >=3 pages (headful, under xvfb)
+      - name: Run against a known-good search URL, >=3 pages (headful, under xvfb)
         env:
           # The proxy goes through the ENVIRONMENT, never a command line,
           # so it cannot appear in the process list or the job log.

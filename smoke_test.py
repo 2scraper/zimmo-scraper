@@ -1617,8 +1617,10 @@ def check_numeric_flags_rejected_when_negative() -> bool:
                     if kw.arg == "type":
                         types_[n.args[0].value] = getattr(kw.value, "id", None)
         wrong = {f: types_.get(f) for f, t in want.items() if types_.get(f) != t}
-        refuses = "refuse_proxy_with_cdp_endpoint" in {
-            getattr(n.func, "id", None) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        called = {getattr(n.func, "id", None) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        # Either directly, or through env_config.validate_run_args(), which
+        # calls it (checked below).
+        refuses = bool({"refuse_proxy_with_cdp_endpoint", "validate_run_args"} & called)
         if wrong or not refuses:
             print(f"       {name}: flag types {wrong}, proxy+cdp refusal called: {refuses}")
             ok = False
@@ -1632,20 +1634,32 @@ def check_numeric_flags_rejected_when_negative() -> bool:
         ok = False
     except SystemExit as e:
         ok &= e.code == 2
+    validate_src = ast.parse(open(os.path.join(_HERE, "env_config.py"), encoding="utf-8").read())
+    ok &= any(isinstance(n, ast.FunctionDef) and n.name == "validate_run_args" and any(
+        isinstance(c, ast.Call) and getattr(c.func, "id", None) == "refuse_proxy_with_cdp_endpoint"
+        for c in ast.walk(n)) for n in ast.walk(validate_src))
     return check("negative --retries/--delay, zero --pages/--concurrency rejected (exit 2) in "
                  "every engine; --proxy with --cdp-endpoint refused", ok)
 
 
 def check_scraper_api_page_verdicts() -> bool:
     """The Scraper API path used to report exit 5 for a served empty page
-    and for a Cloudflare challenge alike; it now uses classify_page()."""
+    and for a Cloudflare challenge alike; it now uses classify_page().
+
+    A page with no listing from THIS path is exit 5, not 4: on 2026-10-28
+    it returned the site's "0 resultaten" for a Gent search that had 63+
+    listings, and the run reported an empty search."""
     import types as _types
     import scraper_api_client as sac
     import output_writer as ow
     tiles = "".join(f'<a class="zimmo-code" href="/nl/x/{i}/">Z{i}</a>' for i in range(6))
     cases = [
         ("served, no listings", 200, "<html><body><p>Geen resultaten</p></body></html>",
-         ow.EXIT_ZERO_PRODUCTS),
+         ow.EXIT_FETCH_FAILED),
+        ("served, '0 resultaten'", 200,
+         "<html><body><h1>Immo te koop in Gent (9000) 0 resultaten</h1>"
+         "<p>We vonden helaas geen resultaten voor je zoekopdracht</p></body></html>",
+         ow.EXIT_FETCH_FAILED),
         ("Cloudflare challenge", 403, SAMPLE_CLOUDFLARE_HTML, ow.EXIT_BLOCKED),
         ("grid rendered, parser read nothing", 200, f"<html><body>{tiles}</body></html>",
          ow.EXIT_FETCH_FAILED),
@@ -1668,7 +1682,8 @@ def check_scraper_api_page_verdicts() -> bool:
                     ok = False
     finally:
         sac.requests.post = real_post
-    return check("Scraper API path: empty 4, challenge 3, parser failure 5, rows 0", ok)
+    return check("Scraper API path: empty page 5 (not 4), challenge 3, parser failure 5, rows 0",
+                 ok)
 
 
 def check_no_private_citations() -> bool:
