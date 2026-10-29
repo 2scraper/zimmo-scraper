@@ -269,33 +269,50 @@ def failure_message(check: ProxyCheck, proxy_url: Optional[str]) -> str:
 
 def gate(pool, target_url: str, timeout: float = PRECHECK_TIMEOUT
          ) -> Optional[ProxyCheck]:
-    """Run the pre-check on the pool's current exit; return it if fatal.
+    """Pre-check every exit of the pool; return a fatal check only when
+    EVERY exit got one.
 
-    One request for the whole run, on the exit page 1 is about to use.
-    A pool's other exits share the account, so one refusal speaks for all.
+    An exit that answers 407 or 402 is retired from the pool for the run
+    (ProxyPool.retire) and the run goes on with the others. Until
+    2026-10-28 only the first exit was checked, and its 407 refused the
+    whole run although the second exit worked (manual test report, #6).
+    One small request per exit (a CONNECT and a HEAD, under 1 KB).
     """
     if not pool:
         return None
-    exit_url = pool.get_exit_for_worker(0).raw_url
-    check = precheck(exit_url, target_url, timeout=timeout)
-    if check.fatal:
-        logger.error("%s", failure_message(check, exit_url))
-        return check
-    if check.outcome == "transport_error":
-        logger.warning("Proxy pre-check through %s did not complete (%s); "
-                       "continuing, the browser will make its own attempt.",
-                       mask(exit_url), check.detail)
-    elif check.outcome == "ok":
-        logger.info("Proxy pre-check through %s: accepted (%s).",
-                    mask(exit_url),
-                    f"site answered {check.status}" if check.status
-                    else check.detail)
+    exits = list(getattr(pool, "_exits", [])) or [pool.get_exit_for_worker(0)]
+    # In parallel: one by one, a file of 40 silent exits took 40 x 15 s.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(16, len(exits))) as ex:
+        checks = list(ex.map(lambda e: precheck(e.raw_url, target_url, timeout=timeout), exits))
+    fatal = []
+    for proxy_exit, check in zip(exits, checks):
+        exit_url = proxy_exit.raw_url
+        if check.fatal:
+            fatal.append(check)
+            if len(exits) > 1:
+                logger.warning("%s Taking this exit out of the pool for the run.",
+                               failure_message(check, exit_url).split(" No browser")[0])
+                pool.retire(proxy_exit)
+            else:
+                logger.error("%s", failure_message(check, exit_url))
+        elif check.outcome == "transport_error":
+            logger.warning("Proxy pre-check through %s did not complete (%s); "
+                           "continuing, the browser will make its own attempt.",
+                           mask(exit_url), check.detail)
+        elif check.outcome == "ok":
+            logger.info("Proxy pre-check through %s: accepted (%s).",
+                        mask(exit_url),
+                        f"site answered {check.status}" if check.status
+                        else check.detail)
+    if fatal and len(fatal) == len(exits):
+        if len(exits) > 1:
+            logger.error("Proxy pre-check: every one of the %d exits was refused (407/402). "
+                         "Check %s and the proxy account. No browser was started and "
+                         "nothing was fetched.", len(exits), PROXY_SOURCES)
+        return fatal[0]
     return None
 
-
-# ---------------------------------------------------------------------------
-# Media blocking
-# ---------------------------------------------------------------------------
 
 def _truthy(value) -> bool:
     if isinstance(value, str):

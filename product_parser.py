@@ -110,6 +110,12 @@ SELECTORS = {
     "item_link": '.zimmo-code',
 }
 
+# What a served page with no listing says, so the readiness wait can stop
+# at once instead of after 45 s. Dutch only: quoted from a live page past
+# the end of a listing in the manual test report of 2026-10-28; the French
+# wording was not captured, so a French page still waits out the timeout.
+NO_RESULTS_TEXTS = ("We vonden helaas geen resultaten",)
+
 # Captures every digit/./space/, character run adjacent to a € sign, as
 # ONE group -- deliberately NOT bounded to a fixed leading-digit width,
 # since that bound is exactly what caused audit finding #8 (a 4+ digit
@@ -245,7 +251,10 @@ _URL_LISTING_TYPES = {"te-koop": "sale", "a-vendre": "sale", "te-huur": "rent", 
 # `epb_*` (Brussels' EPB/PEB certificate), both graded A-G, plus
 # `epc_x.svg` for a listing without a grade -- which stays None rather
 # than becoming a letter. Counted 2026-09-23: 57 epc_, 17 epb_, 1 epc_x.
-_EPC_ICON_RE = re.compile(r"energy-labels/ep[bc]_([a-g])((?:_plus)*)\.svg", re.IGNORECASE)
+# Brussels' PEB scale also has minus grades: `epb_e_minus.svg` was on 3 of 21
+# tiles of bruxelles-1000/a-vendre on 2026-10-28 (the page's own
+# cXenseParse:zimmo_epc meta lists it as E_MINUS) and read as None.
+_EPC_ICON_RE = re.compile(r"energy-labels/ep[bc]_([a-g])((?:_plus)*|_minus)\.svg", re.IGNORECASE)
 
 
 def _tile_features(scope) -> Optional[dict]:
@@ -270,7 +279,9 @@ def _tile_features(scope) -> Optional[dict]:
     if energy is not None:
         m = _EPC_ICON_RE.search(energy["data-src"])
         if m:
-            out["epc_label"] = m.group(1).upper() + "+" * (len(m.group(2)) // len("_plus"))
+            suffix = m.group(2).lower()
+            out["epc_label"] = m.group(1).upper() + (
+                "-" if suffix == "_minus" else "+" * (len(suffix) // len("_plus")))
     return out
 
 
@@ -428,6 +439,13 @@ def _parse_css_fallback(html: str, base_url: str, category: Optional[str]) -> Li
     # price for them) -- the FIX is that this scope is now KEPT, not
     # thrown away and recomputed narrower afterward.
     groups: dict = {}
+    # On a page that has the tile grid, a listing is a tile and nothing
+    # else is. Measured 2026-10-28 on .../te-koop/filter?price=200000-400000:
+    # the filter panel's price chip ("€ 200.000 – € 400.000") sits beside
+    # two links (the logo, "Filters Meer filters") and the walk below made
+    # two rows of it per page, with no sku and the filter's lower bound as
+    # their price.
+    has_tiles = soup.find("zimmo-listing") is not None
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href.startswith("#") or href.startswith("javascript:"):
@@ -445,6 +463,8 @@ def _parse_css_fallback(html: str, base_url: str, category: Optional[str]) -> Li
         if tile is not None:
             base = urljoin(base_url, href.split("#")[0])
             groups.setdefault(base, []).append((a, tile))
+            continue
+        if has_tiles:
             continue
         if not has_price_here:
             candidate = a.parent
@@ -675,6 +695,44 @@ def _parse_properties_json(html: str, base_url: str, category: Optional[str]) ->
             epc_value=_to_float(item.get("energyWaarde")),
         ))
     return products
+
+
+# The search's own total, as the page heads it: "Immo te koop in Gent (9000)
+# 51 resultaten", "0 résultats". Quoted from live pages in the manual test
+# report of 2026-10-28 (Gent, Zwijnaarde page 4, Bruxelles); the markup
+# around it was not captured, so this reads the page TEXT, and takes the
+# FIRST figure (the heading), not one from links further down. Thousands may
+# be grouped with "." or a (non-breaking) space.
+_RESULT_COUNT_RE = re.compile(
+    r"(?<![\d.,])(\d{1,3}(?:[.\u00a0\u202f ]\d{3})+|\d+)\s+"
+    r"(?:resultaten|resultaat|résultats|résultat)\b",
+    re.IGNORECASE)
+
+
+def parse_result_count(html: str) -> Optional[int]:
+    """The number of results the page says its search has, or None when it
+    states none (a page that did not finish rendering, or a challenge)."""
+    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    m = _RESULT_COUNT_RE.search(text)
+    return int(re.sub(r"\D", "", m.group(1))) if m else None
+
+
+def page_result_count(html: str, page_num: int, products_found: int) -> Optional[int]:
+    """The count to judge a page by (output_writer.classify_page).
+
+    With listings on the page, the stated total as is. Without, a count
+    above 0 is believed only on a page after the first that ALSO says it has
+    no result (NO_RESULTS_TEXTS): a heading that rendered over a grid that
+    never loaded is an unfinished page, not the end of the listing, and page
+    1 can never be past the end. Otherwise None ("incomplete")."""
+    count = parse_result_count(html)
+    if products_found or not count:
+        return count
+    if page_num > 1:
+        text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+        if any(t in text for t in NO_RESULTS_TEXTS):
+            return count
+    return None
 
 
 def parse_products(html: str, base_url: str, category: Optional[str] = None) -> List[Product]:

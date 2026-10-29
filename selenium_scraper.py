@@ -31,6 +31,7 @@ Requires: pip install selenium beautifulsoup4 requests --break-system-packages
 
 import argparse
 import logging
+import re
 import sys
 import threading
 import time
@@ -50,26 +51,27 @@ from captcha_solver import (
     detect_turnstile_challenge, solve_turnstile, SolveBudget,
     INJECT_TOKEN_JS, INJECT_TURNSTILE_TOKEN_JS,
 )
-from product_parser import parse_products, SELECTORS
+from product_parser import parse_products, page_result_count, SELECTORS, NO_RESULTS_TEXTS
 from output_writer import (
-    Product, finish_run, finish_without_fetch, dedupe_by_sku, EXIT_CRASH,
+    Product, finish_run, finish_without_fetch, dedupe_by_sku, EXIT_INTERRUPTED,
     classify_page, page_outcome_is_ok, should_retry_page, status_rules_out_listings,
     PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, split_page_result,
+    is_last_page, RunInterrupted, install_interrupt_flag, interrupt_seen,
 )
 import proxy_check
 import proxy_meter
 from env_config import (
     apply_env_defaults, non_negative_int, positive_int, non_negative_float,
-    refuse_proxy_with_cdp_endpoint,
+    recaptcha_score, validate_run_args,
 )
 from proxy_pool import (
-    ProxyPool, load_proxy_file, is_proxy_error,
-    warn_if_concurrency_without_pool, refuse_concurrency_with_cdp_endpoint,
-    redact_secret_patterns,
+    ProxyPool, is_proxy_error, warn_if_concurrency_without_pool,
+    redact_secret_patterns, quiet_late_connection_errors, proxy_urls_from_args,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("selenium_scraper")
+quiet_late_connection_errors()
 
 ITEM_LINK_SELECTOR = SELECTORS["item_link"]
 MIN_CARD_MATCHES = 5
@@ -211,16 +213,36 @@ def handle_captcha_if_present(driver, args, budget: SolveBudget) -> bool:
     return detected_anything
 
 
+def _load_complete(d) -> bool:
+    proxy_meter.drain_selenium(d)   # the budget is enforced while the page loads
+    return d.execute_script("return document.readyState") == "complete"
+
+
+def _ready_state(d) -> str:
+    """"listings", "none" (the page says it has no listing) or "" -- and
+    the proxy meter is fed on every poll, so a budget that runs out while
+    the page is still loading is enforced then, not after the page."""
+    proxy_meter.drain_selenium(d)
+    if len(d.find_elements(By.CSS_SELECTOR, ITEM_LINK_SELECTOR)) > MIN_CARD_MATCHES:
+        return "listings"
+    try:
+        text = d.execute_script("return document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        text = ""
+    return "none" if any(t in text for t in NO_RESULTS_TEXTS) else ""
+
+
 def _wait_for_listing_markers(driver, timeout_s: int = 45) -> bool:
     try:
-        WebDriverWait(driver, timeout_s).until(
-            lambda d: len(d.find_elements(By.CSS_SELECTOR, ITEM_LINK_SELECTOR)) > MIN_CARD_MATCHES
-        )
-        time.sleep(1)
-        return True
+        state = WebDriverWait(driver, timeout_s, poll_frequency=0.5).until(_ready_state)
     except TimeoutException:
         logger.warning("No listing markers appeared within %ds -- parsing whatever loaded.", timeout_s)
         return False
+    if state != "listings":
+        logger.info("The page says it has no listing.")
+        return False
+    time.sleep(1)
+    return True
 
 
 def _navigation_status(driver) -> Optional[int]:
@@ -238,9 +260,18 @@ def _navigation_status(driver) -> Optional[int]:
     return status if isinstance(status, int) and status > 0 else None
 
 
+# A local browser that never started is not worth a retry (#33).
+_LAUNCH_FAILURE_RE = re.compile(r"SessionNotCreated|session not created|cannot find Chrome binary|"
+                                r"Unable to obtain driver|chrome not reachable", re.IGNORECASE)
+
+
 def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                  worker_offset: int) -> Tuple[List[Product], bool, bool, bool, bool]:
     current_exit = proxy_pool.get_exit_for_worker(worker_offset) if proxy_pool else None
+    if proxy_pool and current_exit is None:
+        logger.error("Page %d: every proxy exit is retired for this run -- not fetching it "
+                     "without a proxy.", page_num)
+        return [], False, False, True
 
     # One paid-solve allowance for this page, shared by every attempt and
     # every proxy rotation below (captcha_solver.SolveBudget).
@@ -269,29 +300,47 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
             logger.info("Loading %s (page %d, attempt %d/%d)",
                         url, page_num, attempt + 1, args.retries + 1)
             driver.get(url)
+            proxy_meter.drain_selenium(driver)
             try:
-                wait_obj.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                wait_obj.until(_load_complete)
             except TimeoutException:
-                logger.error("Timeout loading %s.", url)
                 proxy_meter.drain_selenium(driver)
                 if args.cdp_endpoint:
                     driver.close()
                 else:
                     driver.quit()
+                if proxy_pool and current_exit:
+                    # A load that times out through a proxy is that exit
+                    # failing too (#26).
+                    current_exit = proxy_pool.after_failure(
+                        current_exit, worker_offset, args.proxy_rotate,
+                        "Timeout loading page %d" % page_num, url)
+                    if current_exit is None:
+                        return [], False, False, True
+                else:
+                    logger.error("Timeout loading %s.", url)
                 if attempt < args.retries:
                     time.sleep(args.retry_delay)
                     continue
                 return [], False, False, False
 
             http_status = _navigation_status(driver)
-            detected = handle_captcha_if_present(driver, args, budget)
+            # The page renders (or clears a challenge by itself) before a
+            # challenge is looked for or a solve bought -- the same order
+            # in every engine (#4).
             rendered_ok = (False if status_rules_out_listings(http_status)
                            else _wait_for_listing_markers(driver))
+            solves_before = budget.used
+            detected = handle_captcha_if_present(driver, args, budget)
+            if (budget.used > solves_before and not rendered_ok
+                    and not status_rules_out_listings(http_status)):
+                rendered_ok = _wait_for_listing_markers(driver)
 
             html = driver.page_source
             # Everything the page loaded is in the performance log by now.
             proxy_meter.drain_selenium(driver)
             products = parse_products(html, driver.current_url, category=args.category)
+            result_count = page_result_count(html, page_num, len(products))
             logger.info("Parsed %d listing(s) from page %d.", len(products), page_num)
 
             if args.dump_html:
@@ -321,10 +370,13 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
 
             # FIXED (external audit, 2026-10-07, P1/P2): see
             # output_writer.classify_page() -- shared by all three engines.
-            outcome = classify_page(len(products), http_status, detected, rendered_ok)
+            outcome = classify_page(len(products), http_status, detected, rendered_ok,
+                                    result_count)
             if outcome != PAGE_CONTENT:
-                logger.warning("Page %d: HTTP %s, classified as %s.",
-                                page_num, http_status, outcome)
+                logger.warning("Page %d: HTTP %s, %s, classified as %s.",
+                                page_num, http_status,
+                                "no result count on the page" if result_count is None
+                                else f"the site counts {result_count} result(s)", outcome)
             if should_retry_page(outcome, http_status) and attempt < args.retries:
                 time.sleep(args.retry_delay)
                 continue
@@ -333,7 +385,10 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
             if ok and args.delay > 0:
                 time.sleep(args.delay)
 
-            return products, ok, outcome == PAGE_BLOCKED, False, outcome == PAGE_PARSER_FAILED
+            if proxy_pool and current_exit:
+                proxy_pool.record_success(current_exit)   # it reached the site
+            return (products, ok, outcome == PAGE_BLOCKED, False,
+                    outcome == PAGE_PARSER_FAILED, result_count)
 
         except Exception as e:
             error_msg = redact_secret_patterns(str(e))
@@ -343,17 +398,19 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                     driver.quit()
                 except Exception:
                     pass
-            if is_proxy_error(error_msg) and proxy_pool and current_exit:
-                logger.warning("Proxy error on exit %s (%s) -- rotating to a different exit.",
-                                current_exit.masked(), error_msg)
-                if args.proxy_rotate:
-                    next_exit = proxy_pool.rotate_away_from(current_exit, worker_offset)
-                    if next_exit is None:
-                        return [], False, False, True
-                    current_exit = next_exit
-                else:
-                    logger.info("--no-proxy-rotate is set -- retrying the SAME exit rather "
-                                "than rotating away from it.")
+            if interrupt_seen():
+                raise KeyboardInterrupt
+            if not args.cdp_endpoint and _LAUNCH_FAILURE_RE.search(error_msg):
+                logger.error("The local Chrome/chromedriver did not start, so nothing was fetched "
+                             "-- not retrying. (%s)", error_msg.splitlines()[0][:300])
+                return [], False, False, True
+            if (proxy_pool and current_exit
+                    and (is_proxy_error(error_msg) or isinstance(e, TimeoutException))):
+                current_exit = proxy_pool.after_failure(
+                    current_exit, worker_offset, args.proxy_rotate,
+                    "Timeout" if isinstance(e, TimeoutException) else "Proxy error", error_msg)
+                if current_exit is None:
+                    return [], False, False, True
                 continue
             logger.error("Error fetching page %d (attempt %d/%d): %s",
                          page_num, attempt + 1, args.retries + 1, error_msg)
@@ -366,7 +423,8 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
 
 
 def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency: int,
-                               seen_skus_initial=()) -> Tuple[dict, List[int], bool, bool, List[int]]:
+                               seen_skus_initial=(), last_page=None
+                               ) -> Tuple[dict, List[int], bool, bool, List[int]]:
     """See playwright_scraper.py's own copy for the full reasoning --
     identical contract and implementation."""
     page_results: dict = {}
@@ -378,10 +436,10 @@ def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency:
     stop_event = threading.Event()
     workers = max(concurrency, 1)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        pending = {}
-        idx = 0
-
+    executor = ThreadPoolExecutor(max_workers=workers)
+    pending = {}
+    idx = 0
+    try:
         def try_submit():
             nonlocal idx
             while idx < len(remaining_pages) and len(pending) < workers:
@@ -398,7 +456,9 @@ def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency:
         while pending:
             done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
             for fut in done:
-                page_num = pending.pop(fut)
+                # Popped only once its result is read: a Ctrl-C there leaves
+                # the page among the unattempted ones.
+                page_num = pending[fut]
                 try:
                     products, ok, blocked, remote_err = fut.result()
                 except proxy_meter.ProxyBudgetExceeded as e:
@@ -407,11 +467,13 @@ def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency:
                     logger.error("Page %d not fetched: %s.", page_num, e)
                     stop_event.set()
                     unattempted_pages.append(page_num)
+                    del pending[fut]
                     continue
                 except Exception as e:
                     logger.error("Worker raised while fetching page %d: %s",
                                  page_num, redact_secret_patterns(str(e)))
                     products, ok, blocked, remote_err = [], False, False, False
+                del pending[fut]
                 page_results[page_num] = products
                 any_blocked = any_blocked or blocked
                 any_remote_error = any_remote_error or remote_err
@@ -422,9 +484,20 @@ def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency:
                         logger.info("Page %d added no new sku -- listing appears exhausted, "
                                     "not requesting any later page.", page_num)
                         stop_event.set()
+                    elif last_page is not None and last_page(page_num, products, seen_skus):
+                        logger.info("Page %d is the last page of the listing -- not "
+                                    "requesting any later page.", page_num)
+                        stop_event.set()
                 else:
                     failed_pages.append(page_num)
             try_submit()
+    except KeyboardInterrupt:
+        stop_event.set()
+        executor.shutdown(wait=False, cancel_futures=True)
+        unattempted_pages.extend(sorted(set(pending.values()) | set(remaining_pages[idx:])))
+        raise RunInterrupted(page_results, failed_pages, any_blocked, any_remote_error,
+                             sorted(unattempted_pages)) from None
+    executor.shutdown(wait=True)
 
     return page_results, failed_pages, any_blocked, any_remote_error, sorted(unattempted_pages)
 
@@ -432,37 +505,32 @@ def _fetch_pages_concurrently(fetch_fn, remaining_pages: List[int], concurrency:
 def scrape(args) -> int:
     started_at = datetime.now(timezone.utc).isoformat()
 
-    proxy_pool = None
-    if args.proxy_file:
-        urls = load_proxy_file(args.proxy_file)
-        proxy_pool = ProxyPool(urls, shuffle=args.proxy_shuffle, block_retries=args.proxy_block_retries)
-    elif args.proxy:
-        proxy_pool = ProxyPool([args.proxy], block_retries=args.proxy_block_retries)
-
-    warn_if_concurrency_without_pool(args.concurrency, proxy_pool)
-    refuse_concurrency_with_cdp_endpoint(args.concurrency, args.cdp_endpoint)
-
-    # One request through the proxy before a browser exists: a 407 or 402
-    # from the gateway ends the run here, in seconds, instead of surfacing
-    # as a navigation timeout after every retry.
-    refused = proxy_check.gate(proxy_pool, args.url)
+    proxy_pool, refused = _proxy_pool(args)
     if refused:
         return finish_without_fetch(
             args.out, stop_reason=refused.stop_reason,
             pages_requested=args.pages, url=args.url, started_at=started_at)
     meter = proxy_meter.start(args, proxy_pool, remote=bool(args.cdp_endpoint))
 
+    interrupted = False
+    result_counts: dict = {}
+
     url_1 = page_url(args.url, 1)
     try:
-        (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = split_page_result(
-            _fetch_page(url_1, 1, args, proxy_pool, worker_offset=0))
+        (products_1, ok_1, blocked_1, remote_1), parser_failed_1, result_counts[1] = \
+            split_page_result(_fetch_page(url_1, 1, args, proxy_pool, worker_offset=0))
     except proxy_meter.ProxyBudgetExceeded as e:
         logger.error("Stopping: %s.", e)
         (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = \
             ([], False, False, False), False
+    except KeyboardInterrupt:
+        logger.warning("Interrupted (Ctrl-C) while fetching page 1.")
+        (products_1, ok_1, blocked_1, remote_1), parser_failed_1 = \
+            ([], False, False, False), False
+        interrupted = True
 
     page_results = {1: products_1}
-    failed_pages = [] if ok_1 else [1]
+    failed_pages = [] if ok_1 or interrupted else [1]
     any_blocked = blocked_1
     any_remote_error = remote_1
     pages_completed = 1 if ok_1 else 0
@@ -471,6 +539,9 @@ def scrape(args) -> int:
     exhausted_pages: List[int] = []
 
     remaining_pages = list(range(2, args.pages + 1))
+    if interrupted:
+        unattempted_pages = list(range(1, args.pages + 1))
+        remaining_pages = []
     if remaining_pages and not products_1 and not ok_1:
         logger.warning("Page 1 failed entirely -- not attempting pages 2..%d.", args.pages)
         unattempted_pages = remaining_pages
@@ -480,30 +551,46 @@ def scrape(args) -> int:
                      "2..%d are not requested.", args.pages)
         unattempted_pages = remaining_pages
         remaining_pages = []
+    if remaining_pages and ok_1 and is_last_page(products_1, len(products_1), result_counts[1],
+                                                 len({p.sku for p in products_1 if p.sku})):
+        logger.info("Page 1 holds every result the site counts (%s) -- not requesting "
+                    "pages 2..%d.", result_counts[1], args.pages)
+        exhausted_pages = remaining_pages
+        remaining_pages = []
 
     if remaining_pages:
         def fetch_fn(page_num, worker_offset):
             url = page_url(args.url, page_num)
-            result, parser_failed = split_page_result(
+            result, parser_failed, result_counts[page_num] = split_page_result(
                 _fetch_page(url, page_num, args, proxy_pool, worker_offset))
             if parser_failed:
                 parser_failed_pages.append(page_num)
             return result
 
+        def last_page(page_num, products, seen_skus):
+            return is_last_page(products, len(products_1), result_counts.get(page_num),
+                                len(seen_skus))
+
         initial_skus = {p.sku for p in products_1 if p.sku}
-        more_results, more_failed, more_blocked, more_remote, more_unattempted = \
-            _fetch_pages_concurrently(fetch_fn, remaining_pages, args.concurrency, initial_skus)
+        try:
+            more_results, more_failed, more_blocked, more_remote, more_unattempted = \
+                _fetch_pages_concurrently(fetch_fn, remaining_pages, args.concurrency, initial_skus,
+                                          last_page=last_page)
+        except RunInterrupted as e:
+            logger.warning("Interrupted (Ctrl-C): keeping the pages already fetched.")
+            more_results, more_failed, more_blocked, more_remote, more_unattempted = e.partial
+            interrupted = True
         page_results.update(more_results)
         failed_pages.extend(more_failed)
         any_blocked = any_blocked or more_blocked
         any_remote_error = any_remote_error or more_remote
         pages_completed += len(more_results) - len(more_failed)
-        # Pages left undispatched because a page added no new sku: the
-        # listing ENDED, which is a complete answer, not a gap in one.
+        # Pages left undispatched because the listing ENDED: a complete
+        # answer, not a gap in one.
         exhausted_pages = more_unattempted
-        if meter is not None and meter.exceeded:
-            # ...unless the proxy budget stopped dispatch: then they were
-            # simply never asked for.
+        if interrupted or (meter is not None and meter.exceeded):
+            # ...unless Ctrl-C or the proxy budget stopped dispatch: then
+            # they were simply never asked for.
             unattempted_pages = sorted(set(unattempted_pages)
                                        | set(more_unattempted))
             exhausted_pages = []
@@ -520,7 +607,38 @@ def scrape(args) -> int:
         exhausted_pages=exhausted_pages, url=args.url,
         parser_failed_pages=parser_failed_pages,
         proxy=proxy_meter.finish(args),
+        listing_end_seen=_listing_end_seen(page_results, failed_pages, result_counts,
+                                           len(products_1)),
+        interrupted=interrupted,
     )
+
+
+def _listing_end_seen(page_results, failed_pages, result_counts, first_page_size) -> bool:
+    """See playwright_scraper.py's own copy."""
+    seen = set()
+    for page_num in sorted(page_results):
+        products = page_results[page_num]
+        seen |= {p.sku for p in products if p.sku}
+        if page_num in failed_pages:
+            continue
+        if page_num > 1 and is_last_page(products, first_page_size,
+                                         result_counts.get(page_num), len(seen)):
+            return True
+    return False
+
+
+def _proxy_pool(args):
+    """See playwright_scraper.py's own copy: every exit is pre-checked."""
+    urls = getattr(args, "proxy_urls", None)
+    if urls is None:
+        urls = proxy_urls_from_args(args)   # args not built by parse_args()
+    if not urls:
+        return None, None
+    pool = ProxyPool(urls, shuffle=args.proxy_shuffle, block_retries=args.proxy_block_retries)
+    # One request through the proxy before a browser exists: a 407 or 402
+    # from the gateway ends the run here, in seconds, instead of surfacing
+    # as a navigation timeout after every retry.
+    return pool, proxy_check.gate(pool, args.url)
 
 
 def parse_args():
@@ -552,7 +670,7 @@ def parse_args():
                     help="Treat a proxy exit as blocked after this many failures")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
     p.add_argument("--solve-captcha", choices=["always", "when-blocked", "never"], default="when-blocked")
-    p.add_argument("--min-score", type=float, default=None,
+    p.add_argument("--min-score", type=recaptcha_score, default=None,
                     help="Minimum acceptable reCAPTCHA v3 score to request from the solver")
     proxy_check.add_media_flags(p)
     proxy_meter.add_budget_flag(p)
@@ -569,15 +687,20 @@ def parse_args():
     args = p.parse_args()
 
     apply_env_defaults(args)
-    if not args.url:
-        p.error("--url is required (or set ZIMMO_URL in .env)")
-    refuse_proxy_with_cdp_endpoint(p, args)
+    # A login in --cdp-endpoint cannot reach the remote browser through
+    # debuggerAddress: refused here instead of three ~65 s attempts that
+    # end in SessionNotCreatedException (report of 2026-10-28, #5).
+    validate_run_args(p, args, cdp_credentials_supported=False)
+    if not args.proxy_urls:
+        warn_if_concurrency_without_pool(args.concurrency, None)
     return args
 
 
 if __name__ == "__main__":
     args = parse_args()
+    install_interrupt_flag()
     try:
         sys.exit(scrape(args))
     except KeyboardInterrupt:
-        sys.exit(EXIT_CRASH)
+        # Outside the page loop: nothing more to save. Not exit 1 ("crash").
+        sys.exit(EXIT_INTERRUPTED)

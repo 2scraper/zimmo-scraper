@@ -82,12 +82,15 @@ from bs4 import BeautifulSoup
 
 from captcha_solver import detect_cloudflare_challenge
 from product_parser import parse_products, SELECTORS
+from product_parser import parse_result_count
 from output_writer import (
-    finish_run, dedupe_by_sku, EXIT_REMOTE_API_ERROR,
+    finish_run, dedupe_by_sku, EXIT_REMOTE_API_ERROR, EXIT_INTERRUPTED,
     classify_page, page_outcome_is_ok, status_rules_out_listings,
-    PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED,
+    PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, PAGE_EMPTY, PAGE_PAST_END, PAGE_INCOMPLETE,
 )
-from env_config import apply_env_defaults, positive_int
+from env_config import (
+    apply_env_defaults, positive_int, check_url, check_out_prefix, output_suffixes,
+)
 from proxy_pool import redact_secret_patterns
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -106,6 +109,8 @@ SCRAPER_API_BASE = "https://scraper.2captcha.com"
 # instead: confirmed live to appear as genuine rendered price text on
 # every real listing tile (21 occurrences on a real captured page), and
 # not expected to appear on a genuine Cloudflare block page at all.
+# It is a weak signal: reported 2026-10-28, a page with NO listing also has a
+# "€" (in its price filter), so the API returns such a page at once.
 DEFAULT_WAIT_FOR_TEXT = "€"
 
 # Same threshold as the browser engines' readiness wait.
@@ -240,10 +245,25 @@ def scrape(args) -> int:
     rendered_ok = (not status_rules_out_listings(target_status)
                    and len(BeautifulSoup(html, "html.parser").select(SELECTORS["item_link"]))
                    > MIN_CARD_MATCHES)
+    result_count = parse_result_count(html)
     outcome = classify_page(len(products), target_status, detect_cloudflare_challenge(html),
-                            rendered_ok)
+                            rendered_ok, result_count)
     if outcome != PAGE_CONTENT:
         logger.warning("Page 1: HTTP %s, classified as %s.", target_status, outcome)
+    if outcome in (PAGE_EMPTY, PAGE_PAST_END, PAGE_INCOMPLETE):
+        # Not an empty search on this path. Measured 2026-10-28: for
+        # gent-9000/te-koop the Scraper API returned the site's own page
+        # reading "0 resultaten", twice, while the Scraping Browser read
+        # 63 listings off the same URL at the same time -- and the run
+        # reported exit 4, "the search is empty". A page this path brings
+        # back without listings is "content not obtained" (exit 5).
+        logger.warning("The Scraper API returned a page with no listing (%s). On this path "
+                       "that is not taken as an empty search: on 2026-10-28 it returned "
+                       "'0 resultaten' for a Gent search that had 63+ listings. Confirm with "
+                       "a browser engine before reading it as empty.",
+                       "no result count on it" if result_count is None
+                       else f"it states {result_count} result(s)")
+        outcome = PAGE_INCOMPLETE
     ok = page_outcome_is_ok(outcome)
 
     return finish_run(
@@ -278,19 +298,25 @@ def parse_args():
                          "zimmo.be (failed 3x on 2026-08-22, succeeded on 2026-09-16).")
     p.add_argument("--proxy", default=None,
                     help="Route the Scraper API's fetch through a proxy, e.g. "
-                         "http://user:pass@host:port (falls back to ZIMMO_PROXY from .env). "
-                         "UNCONFIRMED payload shape -- see scrape_via_api()'s own docstring.")
+                         "http://user:pass@host:port. Only when given here: ZIMMO_PROXY is "
+                         "NOT read on this path. No pre-check is made for it, and a refused "
+                         "proxy still bills the API request.")
     p.add_argument("--allow-empty", action="store_true",
                     help="Write output even if zero products were found")
     p.add_argument("--dump-html", action="store_true",
                     help="Always save a debug .html, on success too")
     args = p.parse_args()
 
-    apply_env_defaults(args)
+    # ZIMMO_PROXY is for the browser engines' local browser. It used to be
+    # passed to the API too, silently and with no pre-check (report of
+    # 2026-10-28, #18); here a proxy is used only when --proxy says so.
+    apply_env_defaults(args, skip=("proxy",))
     if not args.url:
         p.error("--url is required (or set ZIMMO_URL in .env)")
+    check_url(p, args)
     if not args.twocaptcha_key:
         p.error("--twocaptcha-key is required (or set TWOCAPTCHA_KEY in .env)")
+    check_out_prefix(p, args.out, output_suffixes(args.format) + ["_debug.html"])
     return args
 
 
@@ -299,4 +325,4 @@ if __name__ == "__main__":
     try:
         sys.exit(scrape(args))
     except KeyboardInterrupt:
-        sys.exit(1)
+        sys.exit(EXIT_INTERRUPTED)

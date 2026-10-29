@@ -21,6 +21,25 @@ here rather than treated as a violation of the format.
 > its rows and exits **6** (**5** with none) with `stop_reason:
 > proxy_budget_exceeded`, and it always writes
 > `<out>.latest_attempt.meta.json`.
+>
+> **Behaviour change (manual test report, 2026-10-28).** A served page with
+> no listing is now judged by the result count the page states: 0 is an
+> empty search (exit 4); more than 0, on a later page that also says "We
+> vonden helaas geen resultaten", is past the end of the listing (the run
+> stops, `complete`, `listing_exhausted: true`); anything else means the
+> page did not finish rendering (retried, then a failed page, never
+> "empty"). A proxy exit's failure count resets on a page that reached the
+> site, and when every exit is at `--proxy-block-retries` the least-failed
+> one is still used; only a pre-check refusal drops an exit for good.
+> The Scraper API path reports a page without listings as exit 5, not 4.
+> Ctrl-C writes the rows gathered so far as partial (exit 6,
+> `stop_reason: interrupted`), or exits 130 with none; it used to exit 1
+> and lose them. A bad `--url`, `--out`, `--proxy`/`--proxy-file`,
+> `--min-score`, `--concurrency` with `--cdp-endpoint`, or (Selenium) a
+> `--cdp-endpoint` with a login is refused before the first request, exit
+> 2. An explicitly empty `--cdp-endpoint ""` or `export ZIMMO_PROXY=` now
+> means "off" instead of falling back to `.env`. The Scraper API client no
+> longer reads `ZIMMO_PROXY`.
 
 ### Added
 
@@ -64,6 +83,12 @@ here rather than treated as a violation of the format.
 
 ### Changed
 
+- `pyproject.toml`'s `playwright` extra pins `playwright==1.44.0`, as
+  `requirements-playwright.txt` and the Docker image do; it said `>=1.44`.
+- README: Python 3.13+ install note for the 1.44 pin, how far the 10 MB
+  proxy budget goes (~2.6 MB per page measured), that `--block-media` saves
+  next to nothing here, the four always-null columns, project "Vanaf"
+  prices, and the canary's search (it has no filter).
 - CI: the canary no longer runs on a push that changes `canary.yml`; it runs weekly (Mondays) and on manual dispatch only, because every run bills the proxy.
 - `pyproject.toml` lists `proxy_check` (missing since it was added) and
   `proxy_meter` among the installed modules.
@@ -73,6 +98,69 @@ here rather than treated as a violation of the format.
 
 ### Fixed
 
+Found in a manual test of `c4795bb` on 2026-10-27/28; numbers are that
+report's.
+
+- Brussels' minus energy grades (`epb_e_minus.svg`) read as `null`; now
+  `E-` (3 of 21 tiles on bruxelles-1000/a-vendre).
+- On a price-filtered search (`.../filter?price=200000-400000`) the filter
+  panel's price chip became two rows per page with no `sku`, a link to the
+  home page and the filter's lower bound as price. On a page with the tile
+  grid only `<zimmo-listing>` tiles are rows.
+- The page after the last one (now HTTP 200, the search's total and no
+  tile, not page 1 again) waited 45 s and finished `listing_exhausted:
+  false`, so `diff_runs.py` could never report a removal. It is recognised
+  by the result count, ends the listing, and a Dutch one ends the wait at
+  once; the run also stops once it holds every counted result on a short
+  page.
+- A page cut off mid-load (HTTP 200, nothing rendered) counted as a served
+  empty page, so a dying proxy read as the end of the listing.
+- The Scraper API's "0 resultaten" for a Gent search with 63+ listings was
+  reported as an empty search, exit 4.
+- Playwright looked for a Turnstile field straight after navigation, before
+  it existed, and said nothing about the challenge; every engine now waits
+  for the page first, then detects, then solves.
+- `--proxy-file`: only the first exit was pre-checked, and its 407 refused
+  the whole pool. Every exit is checked; a refused one is dropped.
+- Proxy rotation: a navigation that timed out through an exit did not count
+  as that exit failing, so a silent exit was retried while a working one
+  was never tried, and an exit retired by `--proxy-block-retries` ("will not
+  be re-selected") was selected again for the next page. A page now starts
+  on the exit with the fewest failures and never on a retired one; with
+  every exit retired the page fails instead of going out without a proxy.
+- A proxy written `host:port:user:pass` (the form the 2Captcha dashboard
+  gives) raised a traceback, exit 1, that printed the password. It is
+  accepted; no proxy parse error prints the value any more.
+- A missing or empty `--proxy-file`, `--out` in a missing directory or onto
+  a directory, a non-zimmo.be `--url`, a `--url` with `page=2` (fetched as
+  page 1 and again as page 2), `--min-score 5`, a SOCKS proxy with a login,
+  and `--concurrency 2` with `--cdp-endpoint` (exit 1) were found only
+  after fetching, or as a traceback. All are exit 2 before the first
+  request.
+- Selenium with a credentialled `--cdp-endpoint` spent ~3.5 minutes on
+  three attempts it knew would fail; refused up front.
+- A wrong Scraping Browser password: three attempts and a generic message
+  (Playwright, 36 s), three 60-second "did not answer" timeouts with the
+  401 only in a traceback (pyppeteer, 187 s). Now one attempt and a message
+  naming `ZIMMO_CDP_ENDPOINT`; pyppeteer watches the websocket handshake
+  itself.
+- Ctrl-C: exit 1 and the fetched pages lost on every engine; pyppeteer's
+  own signal handler and exit hook added tracebacks.
+- A local browser that failed to start (pyppeteer's x86 Chromium on Apple
+  Silicon, headless) was retried and reported as "Remote API error". It is
+  not retried, and the message says the local browser did not start; the
+  zero-row message no longer says "Remote API error" for causes that are
+  not a remote API.
+- Selenium's proxy budget was read only after a page had fully loaded and
+  its URL block was sent without `Network.enable`: a 0.1 MB budget stopped
+  at 4.6 MB. On a metered run it now navigates to DOMContentLoaded and
+  reads the meter while the page loads.
+- `diff_runs.py` could not compare a `--format csv` run (it looked for
+  `run.csv.meta.json`) and called a missing file a missing sidecar.
+- "Future/Task exception was never retrieved" tracebacks after a finished
+  run are one DEBUG line.
+- With `--no-proxy-rotate` every failure logged "rotating to a different
+  exit" and then "retrying the SAME exit"; one line now says what happens.
 - The pyppeteer and Selenium proxy meter counts only `http://` / `https://` requests and responses that came over the network. Chrome's own loads (the `chrome://` new-tab page, `data:`, `blob:`), cache hits (`requestServedFromCache`, `fromDiskCache`, `fromPrefetchCache`, `fromServiceWorker`) and Chrome's error page count nothing. A sibling repo's Selenium run had counted about 2.8 MB of new-tab scripts while its proxy carried about 6 KB. The pyppeteer block sent once the budget is spent now reaches the page's own event loop even when the budget runs out on another thread.
 
 ## [2.0.0] — 2026-10-15

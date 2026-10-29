@@ -23,7 +23,8 @@ check when a key "isn't working".
 import argparse
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
 # --- Numeric flag types -----------------------------------------------------
@@ -52,6 +53,88 @@ def non_negative_float(text: str) -> float:
     if not value >= 0:   # also rejects nan
         raise argparse.ArgumentTypeError(f"must be 0 or more, got {text}")
     return value
+
+
+def recaptcha_score(text: str) -> float:
+    """--min-score: a reCAPTCHA v3 score is 0.1-0.9."""
+    value = float(text)
+    if not 0.1 <= value <= 0.9:
+        raise argparse.ArgumentTypeError(f"must be between 0.1 and 0.9, got {text}")
+    return value
+
+
+# --- Checks made before anything is fetched -------------------------------
+#
+# Reported 2026-10-28: a bad --out, --url or --proxy-file was found only
+# after the pages had been fetched (and a Scraping Browser session paid
+# for), and ended as a traceback, exit 1. Each of these is a usage error,
+# exit 2, decided before the first request.
+
+SITE_HOST = "zimmo.be"
+
+
+def check_url(parser: argparse.ArgumentParser, args) -> None:
+    parsed = urlparse(args.url or "")
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or not (
+            host == SITE_HOST or host.endswith("." + SITE_HOST)):
+        parser.error(f"--url must be a {SITE_HOST} search-results URL "
+                     f"(https://www.{SITE_HOST}/nl/...), got {args.url!r}")
+    # The run numbers its own pages: a `page` in --url used to be fetched
+    # as "page 1" AND again as page 2, while the sidecar recorded the
+    # search without it.
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    pages = [v for k, v in query if k == "page"]
+    if pages and pages != ["1"]:
+        parser.error(f"--url carries page={pages[0]}: pass the search without a page "
+                     f"parameter and choose how many pages with --pages")
+    if pages:
+        args.url = urlunparse(parsed._replace(
+            query=urlencode([(k, v) for k, v in query if k != "page"])))
+
+
+def check_out_prefix(parser: argparse.ArgumentParser, out: str,
+                     suffixes: Iterable[str]) -> None:
+    """Every file a run may write is `<out><suffix>`: its directory must
+    exist and be writable, and none of those paths may be a directory."""
+    directory = os.path.dirname(os.path.abspath(out))
+    if not os.path.isdir(directory):
+        parser.error(f"--out {out!r}: directory {directory!r} does not exist")
+    if not os.access(directory, os.W_OK | os.X_OK):
+        parser.error(f"--out {out!r}: directory {directory!r} is not writable")
+    for suffix in suffixes:
+        if os.path.isdir(out + suffix):
+            parser.error(f"--out {out!r}: {out + suffix!r} is a directory")
+
+
+def output_suffixes(fmt: str):
+    return ([".json"] if fmt in ("json", "both") else []) + \
+           ([".csv"] if fmt in ("csv", "both") else []) + \
+           [".meta.json", ".latest_attempt.meta.json"]
+
+
+def validate_run_args(parser: argparse.ArgumentParser, args, *,
+                      cdp_credentials_supported: bool = True) -> None:
+    """The browser engines' shared checks, after apply_env_defaults()."""
+    from proxy_pool import proxy_urls_from_args
+
+    if not args.url:
+        parser.error("--url is required (or set ZIMMO_URL in .env)")
+    check_url(parser, args)
+    refuse_proxy_with_cdp_endpoint(parser, args)
+    if args.cdp_endpoint and args.concurrency > 1:
+        parser.error("--concurrency > 1 is not supported together with --cdp-endpoint: the "
+                     "Scraping Browser API allows one live connection per profile")
+    if args.cdp_endpoint and not cdp_credentials_supported and "@" in (
+            urlparse(args.cdp_endpoint).netloc):
+        parser.error("this engine attaches through Selenium's debuggerAddress, which cannot "
+                     "send the login in --cdp-endpoint / ZIMMO_CDP_ENDPOINT; use "
+                     "playwright_scraper.py or puppeteer_scraper.py for the Scraping Browser")
+    try:
+        args.proxy_urls = proxy_urls_from_args(args)
+    except ValueError as e:
+        parser.error(str(e))
+    check_out_prefix(parser, args.out, output_suffixes(args.format))
 
 
 def refuse_proxy_with_cdp_endpoint(parser: argparse.ArgumentParser, args) -> None:
@@ -142,21 +225,31 @@ def _is_placeholder(value: Optional[str]) -> bool:
     return False
 
 
-def apply_env_defaults(args, dotenv_path: Optional[str] = None) -> None:
+def apply_env_defaults(args, dotenv_path: Optional[str] = None,
+                       skip: Iterable[str] = ()) -> None:
     """Fill any argparse Namespace attribute that is still None/unset,
     using ENV_KEYS -> exported environment variable -> .env file, in that
     order. Never overwrites a value the caller already provided on the
-    command line -- that precedence is the whole point of this function."""
+    command line -- that precedence is the whole point of this function.
+
+    An EMPTY value given explicitly -- `--cdp-endpoint ""` or
+    `export ZIMMO_PROXY=` -- means "off for this run" and stops the lookup
+    there: before 2026-10-28 it fell through to .env, so a .env holding
+    both ZIMMO_PROXY and ZIMMO_CDP_ENDPOINT could not be run with either
+    one alone without editing the file. Destinations in `skip` are never
+    filled (the Scraper API client does not take ZIMMO_PROXY implicitly)."""
     dotenv_values = _load_dotenv_values(dotenv_path)
 
     for env_var, dest in ENV_KEYS.items():
-        if not hasattr(args, dest):
+        if not hasattr(args, dest) or dest in skip:
             continue
         current = getattr(args, dest)
-        if current not in (None, ""):
+        if current is not None:
             continue  # an explicit CLI flag always wins -- never overwrite it
 
         exported = os.environ.get(env_var)
+        if exported is not None and not exported.strip():
+            continue  # exported empty: off for this run
         if not _is_placeholder(exported):
             setattr(args, dest, exported)
             continue
@@ -184,7 +277,9 @@ if __name__ == "__main__":
     for env_var in ENV_KEYS:
         exported = os.environ.get(env_var)
         from_file = dotenv_values.get(env_var)
-        if not _is_placeholder(exported):
+        if exported is not None and not exported.strip():
+            source, masked = "exported EMPTY (off; .env not read)", "(not set)"
+        elif not _is_placeholder(exported):
             source, masked = "exported environment variable", _mask(exported)
         elif not _is_placeholder(from_file):
             source, masked = ".env file", _mask(from_file)
