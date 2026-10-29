@@ -24,9 +24,13 @@ here rather than treated as a violation of the format.
 >
 > **Behaviour change (manual test report, 2026-10-28).** A served page with
 > no listing is now judged by the result count the page states: 0 is an
-> empty search (exit 4), more than 0 is past the end of the listing (the
-> run stops, `complete`, `listing_exhausted: true`), none means the page
-> did not finish rendering (retried, then a failed page, never "empty").
+> empty search (exit 4); more than 0, on a later page that also says "We
+> vonden helaas geen resultaten", is past the end of the listing (the run
+> stops, `complete`, `listing_exhausted: true`); anything else means the
+> page did not finish rendering (retried, then a failed page, never
+> "empty"). A proxy exit's failure count resets on a page that reached the
+> site, and when every exit is at `--proxy-block-retries` the least-failed
+> one is still used; only a pre-check refusal drops an exit for good.
 > The Scraper API path reports a page without listings as exit 5, not 4.
 > Ctrl-C writes the rows gathered so far as partial (exit 6,
 > `stop_reason: interrupted`), or exits 130 with none; it used to exit 1

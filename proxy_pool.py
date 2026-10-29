@@ -184,10 +184,15 @@ class ProxyPool:
     went back to the exit that had just failed, while the third, working
     exit was never used. Now:
 
-    * an exit that reached --proxy-block-retries failures is retired and is
-      never handed out again, by get_exit_for_worker() either;
+    * an exit that reached --proxy-block-retries failures in a row is not
+      handed out while another exit is usable; a page that reached the site
+      through an exit (record_success) clears its count, so slow pages
+      spread over a long run do not retire a working exit;
     * among the rest, the exit with the FEWEST failures is chosen, so a page
       starts on an exit that has not failed this run whenever one exists;
+    * when every exit has reached the limit, the next page still starts on
+      the least-failed one (as before this change) -- only an exit the
+      pre-check refused (retire()) is never used again;
     * rotate_away_from() never returns the exit that just failed while
       another usable one exists.
     """
@@ -200,6 +205,7 @@ class ProxyPool:
             random.shuffle(exits)
         self._exits = exits
         self._block_retries = block_retries
+        self._refused: set = set()
         self._lock = threading.Lock()
 
     def __len__(self) -> int:
@@ -214,15 +220,23 @@ class ProxyPool:
         return best[worker_offset % len(best)]
 
     def get_exit_for_worker(self, worker_offset: int) -> Optional[ProxyExit]:
-        """None once every exit is retired: the caller must then fail the
-        page, never fall back to a direct connection."""
+        """None only when every exit was refused by the pre-check: the
+        caller must then fail the page, never fall back to a direct
+        connection."""
         with self._lock:
-            usable = self._usable()
+            usable = self._usable() or [e for e in self._exits if id(e) not in self._refused]
             return self._pick(usable, worker_offset) if usable else None
+
+    def record_success(self, good: ProxyExit) -> None:
+        """A page reached the site through `good`: its failures were not in a row."""
+        with self._lock:
+            if id(good) not in self._refused:
+                good.failure_count = 0
 
     def retire(self, dead: ProxyExit) -> None:
         """Take an exit out of the run for good (the pre-check's 407/402)."""
         with self._lock:
+            self._refused.add(id(dead))
             dead.failure_count = max(dead.failure_count, self._block_retries)
 
     def rotate_away_from(self, dead: ProxyExit, worker_offset: int) -> Optional[ProxyExit]:

@@ -100,6 +100,14 @@ def test_result_count_and_page_verdicts():
     assert parse_result_count("<p>0 résultats</p>") == 0
     assert parse_result_count("<p>1.234 resultaten</p>") == 1234
     assert parse_result_count("<p>loading</p>") is None
+    assert parse_result_count("<p>1\u00a0234 résultats</p>") == 1234
+    assert parse_result_count("<h1>63 resultaten</h1><a>Antwerpen (412 resultaten)</a>") == 63
+    # Review finding: a heading over a grid that never loaded is not the end.
+    from product_parser import page_result_count
+    assert page_result_count("<h1>63 resultaten</h1>", 2, 0) is None
+    assert page_result_count(PAST_END, 1, 0) is None
+    assert page_result_count(PAST_END, 4, 0) == 51
+    assert page_result_count("<h1>0 resultaten</h1>", 1, 0) == 0
     assert ow.classify_page(0, 200, False, False, 51) == ow.PAGE_PAST_END
     assert ow.classify_page(0, 200, False, False, 0) == ow.PAGE_EMPTY
     assert ow.classify_page(0, 200, False, False, None) == ow.PAGE_INCOMPLETE
@@ -183,10 +191,28 @@ def test_pool_prefers_exits_that_have_not_failed_and_never_hands_out_a_retired_o
     a, b, c = pool._exits
     assert pool.after_failure(a, 0, True, "Timeout", "x") is b
     assert pool.after_failure(b, 0, True, "Timeout", "x") is c
-    # a and b are retired: every page now starts on c, never on a.
+    # a and b reached the limit: every page now starts on c, never on a.
     assert {pool.get_exit_for_worker(i).host for i in range(5)} == {"c"}
     assert pool.after_failure(c, 0, True, "Timeout", "x") is None
+    # Every exit at the limit: the next page still gets one (review finding:
+    # a lone gateway must not be retired by slow pages)...
+    assert pool.get_exit_for_worker(0) is not None
+    # ...but one the pre-check refused is never handed out again.
+    for e in (a, b, c):
+        pool.retire(e)
     assert pool.get_exit_for_worker(0) is None
+
+
+def test_a_good_page_clears_an_exits_failures():
+    pool = proxy_pool.ProxyPool(["http://only:1"], block_retries=3)
+    only = pool._exits[0]
+    for _ in range(2):
+        pool.after_failure(only, 0, True, "Timeout", "x")
+    pool.record_success(only)
+    assert only.failure_count == 0
+    for _ in range(5):
+        pool.after_failure(only, 0, True, "Timeout", "x")
+    assert pool.get_exit_for_worker(0) is only
 
 
 def test_no_rotate_logs_one_line(caplog):
@@ -361,6 +387,23 @@ def test_cut_off_page_is_failed_not_empty(engine, monkeypatch, tmp_path):
     meta = _meta(tmp_path)
     assert meta["failed_pages"] == [2] and meta["listing_exhausted"] is False
     assert site.navigations == 3, "the cut-off page is retried once"
+
+
+def test_heading_without_tiles_on_page_1_is_not_an_empty_search(engine, monkeypatch, tmp_path):
+    """Review finding: page 1 with the count rendered and the grid not was
+    'past the end', so the run reported exit 4 for a 63-result search."""
+    site = Site({1: (200, "<h1>Immo te koop in Gent (9000) 63 resultaten</h1>", 0)})
+    mod, run = engine(monkeypatch, site)
+    assert run(_args(tmp_path, pages=3, retries=0)) == ow.EXIT_FETCH_FAILED
+
+
+def test_heading_without_tiles_later_is_a_failed_page(engine, monkeypatch, tmp_path):
+    site = Site({1: (200, WITH_COUNT, 7), 2: (200, "<h1>51 resultaten</h1>", 0),
+                 3: (200, WITH_COUNT, 7)})
+    mod, run = engine(monkeypatch, site)
+    assert run(_args(tmp_path, pages=3, retries=0)) == ow.EXIT_PARTIAL
+    meta = _meta(tmp_path)
+    assert 2 in meta["failed_pages"] and meta["listing_exhausted"] is False
 
 
 def _interrupt_on(site, page, exc):

@@ -346,21 +346,24 @@ does not serve is HTTP 404 ("Pagina niet gevonden"); 429 and 5xx are
 retried up to `--retries` times and then count as failed.
 
 A served page with no listing is judged by the search's own result count
-the page states ("51 resultaten" / "51 résultats"): a count of 0 is an
-**empty search**; a count above 0 means the page is **past the end of the
-listing** (measured 2026-10-28: page 4 of a 51-result search, HTTP 200,
-"We vonden helaas geen resultaten"), and the run stops there, `complete`
-with `listing_exhausted: true`; **no count at all** means the page never
-finished rendering (a load cut off by a dying proxy, say) — it is retried
-and then counts as failed, never as the end of the listing. The run also
-stops without asking for the next page once it holds every result the
-site counts and the last page was shorter than page 1, and when a page
-adds no new listing (how the site answered past the end before October
-2026). The count is read from the page text; that wording was quoted from
-live Dutch and French pages, but the markup around it has not been
-captured, so if the site changes it, an empty search reads as exit 5
-instead of 4, never the other way round. A Dutch page past the end stops
-the 45-second readiness wait at once; a French one still waits it out.
+the page states ("51 resultaten" / "51 résultats", the first one on the
+page): a count of 0 is an **empty search**; a later page with a count
+above 0 that also says "We vonden helaas geen resultaten" is **past the end
+of the listing** (measured 2026-10-28: page 4 of a 51-result search, HTTP
+200), and the run stops there, `complete` with `listing_exhausted: true`.
+Anything else without a listing — no count, or a count over a grid that
+never loaded, and always on page 1 — means the page did not finish
+rendering (a load cut off by a dying proxy, say): it is retried and then
+counts as failed, never as the end of the listing. The run also stops
+without asking for the next page once it holds every result the site
+counts and the last page was shorter than page 1, and when a page adds no
+new listing (how the site answered past the end before October 2026). The
+count and the Dutch "no result" line are read from the page text, quoted
+from live pages; the markup around them has not been captured, and the
+French "no result" wording is not known, so a French page past the end
+ends the run partial (exit 6) rather than complete. If the site changes
+that wording, the error is always toward "not obtained", never toward a
+false "empty" or "complete".
 
 A page whose listing grid rendered but parsed to zero rows is
 a **parser failure** (`parser_failed_pages`), never an empty search. A

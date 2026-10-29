@@ -51,7 +51,7 @@ from captcha_solver import (
     detect_turnstile_challenge, solve_turnstile, SolveBudget,
     INJECT_TOKEN_JS, INJECT_TURNSTILE_TOKEN_JS,
 )
-from product_parser import parse_products, parse_result_count, SELECTORS, NO_RESULTS_TEXTS
+from product_parser import parse_products, page_result_count, SELECTORS, NO_RESULTS_TEXTS
 from output_writer import (
     Product, finish_run, finish_without_fetch, dedupe_by_sku, EXIT_INTERRUPTED,
     classify_page, page_outcome_is_ok, should_retry_page, status_rules_out_listings,
@@ -340,7 +340,7 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
             # Everything the page loaded is in the performance log by now.
             proxy_meter.drain_selenium(driver)
             products = parse_products(html, driver.current_url, category=args.category)
-            result_count = parse_result_count(html)
+            result_count = page_result_count(html, page_num, len(products))
             logger.info("Parsed %d listing(s) from page %d.", len(products), page_num)
 
             if args.dump_html:
@@ -385,6 +385,8 @@ def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
             if ok and args.delay > 0:
                 time.sleep(args.delay)
 
+            if proxy_pool and current_exit:
+                proxy_pool.record_success(current_exit)   # it reached the site
             return (products, ok, outcome == PAGE_BLOCKED, False,
                     outcome == PAGE_PARSER_FAILED, result_count)
 

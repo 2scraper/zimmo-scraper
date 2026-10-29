@@ -281,10 +281,13 @@ def gate(pool, target_url: str, timeout: float = PRECHECK_TIMEOUT
     if not pool:
         return None
     exits = list(getattr(pool, "_exits", [])) or [pool.get_exit_for_worker(0)]
+    # In parallel: one by one, a file of 40 silent exits took 40 x 15 s.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(16, len(exits))) as ex:
+        checks = list(ex.map(lambda e: precheck(e.raw_url, target_url, timeout=timeout), exits))
     fatal = []
-    for proxy_exit in exits:
+    for proxy_exit, check in zip(exits, checks):
         exit_url = proxy_exit.raw_url
-        check = precheck(exit_url, target_url, timeout=timeout)
         if check.fatal:
             fatal.append(check)
             if len(exits) > 1:

@@ -700,10 +700,12 @@ def _parse_properties_json(html: str, base_url: str, category: Optional[str]) ->
 # The search's own total, as the page heads it: "Immo te koop in Gent (9000)
 # 51 resultaten", "0 résultats". Quoted from live pages in the manual test
 # report of 2026-10-28 (Gent, Zwijnaarde page 4, Bruxelles); the markup
-# around it was not captured, so this reads the page TEXT. The highest
-# figure is taken, in case a facet elsewhere states a smaller one.
+# around it was not captured, so this reads the page TEXT, and takes the
+# FIRST figure (the heading), not one from links further down. Thousands may
+# be grouped with "." or a (non-breaking) space.
 _RESULT_COUNT_RE = re.compile(
-    r"(?<![\d.,])(\d{1,3}(?:\.\d{3})+|\d+)\s+(?:resultaten|resultaat|résultats|résultat)\b",
+    r"(?<![\d.,])(\d{1,3}(?:[.\u00a0\u202f ]\d{3})+|\d+)\s+"
+    r"(?:resultaten|resultaat|résultats|résultat)\b",
     re.IGNORECASE)
 
 
@@ -711,8 +713,26 @@ def parse_result_count(html: str) -> Optional[int]:
     """The number of results the page says its search has, or None when it
     states none (a page that did not finish rendering, or a challenge)."""
     text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
-    counts = [int(m.group(1).replace(".", "")) for m in _RESULT_COUNT_RE.finditer(text)]
-    return max(counts) if counts else None
+    m = _RESULT_COUNT_RE.search(text)
+    return int(re.sub(r"\D", "", m.group(1))) if m else None
+
+
+def page_result_count(html: str, page_num: int, products_found: int) -> Optional[int]:
+    """The count to judge a page by (output_writer.classify_page).
+
+    With listings on the page, the stated total as is. Without, a count
+    above 0 is believed only on a page after the first that ALSO says it has
+    no result (NO_RESULTS_TEXTS): a heading that rendered over a grid that
+    never loaded is an unfinished page, not the end of the listing, and page
+    1 can never be past the end. Otherwise None ("incomplete")."""
+    count = parse_result_count(html)
+    if products_found or not count:
+        return count
+    if page_num > 1:
+        text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+        if any(t in text for t in NO_RESULTS_TEXTS):
+            return count
+    return None
 
 
 def parse_products(html: str, base_url: str, category: Optional[str] = None) -> List[Product]:
