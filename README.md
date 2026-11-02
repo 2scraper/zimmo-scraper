@@ -1,4 +1,4 @@
-# zimmo-scraper
+# Zimmo Scraper — Belgian Property Listings in Python
 
 ![release](https://img.shields.io/github/v/release/2scraper/zimmo-scraper?include_prereleases)
 ![tests](https://img.shields.io/github/actions/workflow/status/2scraper/zimmo-scraper/tests.yml?branch=main&label=tests)
@@ -7,6 +7,8 @@
 ![license](https://img.shields.io/github/license/2scraper/zimmo-scraper?cacheSeconds=3600)
 ![engines](https://img.shields.io/badge/engines-Playwright%20%7C%20Selenium%20%7C%20Puppeteer-informational)
 ![what you need](https://img.shields.io/badge/what%20you%20need-a%20residential%20exit%20%2B%20headful%20browser-orange)
+
+**Zimmo scraper** — an open-source (MIT) Python tool that reads zimmo.be search results, for sale and for rent, on the Dutch and French sites, and writes one row per listing — price, address, property type, living area, bedrooms and energy grade (EPC) — to JSON or CSV. zimmo.be sits behind Cloudflare: when measured on 2026-09-23, a headful browser on a residential exit (or the 2Captcha Scraping Browser API) was served, while datacentre addresses and headless Chromium were refused. Use it to build a dataset of Belgian property listings, or to compare two runs of the same search with the bundled `diff_runs.py`.
 
 Zimmo.be real-estate listing scraper (Playwright, Selenium, Puppeteer, or
 the 2Captcha Scraping Browser API via CDP) — sale and rent listings, prices,
@@ -452,15 +454,22 @@ checked for drift by `smoke_test.py`, so a consumer outside Python can
 validate a run. `x-schema-version` goes up whenever a column is added,
 renamed or removed, and the CHANGELOG says so.
 
-## Repo maintenance notes (not shipped behaviour)
+## Guides
 
-- Private per-clone notes, if you keep any, belong in
-  `.git/info/exclude`, not `.gitignore`.
-- Before making this repo public, scan every blob that ever existed
-  (`git rev-list --objects --all`) for credentials, not just the
-  current working tree.
-- Add this repo as a row in `2scraper/.github`'s `profile/README.md`
-  once it's public, and check that row with a logged-out request.
+- [How to run the 2scraper scrapers: setup, proxies, exit codes and access modes](https://2captcha.com/h/how-to-run-2scraper-open-source-scrapers) — installation, `.env`, `.meta.json` for the whole family.
+
+## Related scrapers
+
+Same CLI conventions, same output contract (one row per item, JSON or CSV, a `.meta.json` sidecar and shared exit codes):
+
+- [Autotrader scraper](https://github.com/2scraper/autotrader-scraper) — US car listings with VIN, fee-inclusive price, KBB fair…
+- [Avito scraper](https://github.com/2scraper/avito-scraper) — Category and search listings, item pages and seller profiles…
+- [Craigslist scraper](https://github.com/2scraper/craigslist-scraper) — Result lists and adverts from all 714 areas
+- [dubizzle scraper](https://github.com/2scraper/dubizzle-scraper) — UAE classifieds — motors, property, electronics, jobs…
+- [Facebook Marketplace scraper](https://github.com/2scraper/facebook-marketplace-scraper) — Marketplace listings by keyword, category, location…
+- [MakeMyTrip scraper](https://github.com/2scraper/makemytrip-scraper) — Hotel prices with taxes and fees, ratings, stars…
+
+All scrapers: [github.com/2scraper](https://github.com/2scraper) · Need another site? [Open a request](https://github.com/2scraper/.github/issues/new?title=%5BScraper%20request%5D%20)
 
 ## Contributing
 
