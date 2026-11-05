@@ -5,6 +5,8 @@
 !sample_output.json
 !product.schema.json
 !sample_output.csv
+# A trimmed Fingerprint API response the offline suite reads.
+!fixtures/fingerprint_chromium.json
 zimmo_listings.*
 *_debug.html
 *_debug.png

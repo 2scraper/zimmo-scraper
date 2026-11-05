@@ -3049,6 +3049,365 @@ def check_canary_reports_proxy_traffic() -> bool:
     return ok
 
 
+# ---------------------------------------------------------------------------
+# 2Captcha fingerprint (Playwright, local browser only)
+# ---------------------------------------------------------------------------
+
+_FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+def _fp_fixture():
+    with open(os.path.join(_FIXTURES, "fingerprint_chromium.json"), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _fp_skip(what, why) -> bool:
+    """A skipped fingerprint check is a FAILURE where the Playwright engine
+    is required (FINGERPRINT_REQUIRE_PLAYWRIGHT=1, set by CI's Playwright
+    job), so a broken import there cannot pass as a skip."""
+    if os.environ.get("FINGERPRINT_REQUIRE_PLAYWRIGHT") == "1":
+        return check(f"{what} (required here, but: {why})", False)
+    print(f"[SKIP] {what} -- {why}")
+    return True
+
+
+class _FpEnvOff:
+    """Every ENV_KEYS variable exported EMPTY (= off for the run), so neither
+    the caller's environment nor a local .env can answer for a flag."""
+
+    def __enter__(self):
+        import env_config
+        self.saved = {k: os.environ.get(k) for k in env_config.ENV_KEYS}
+        for k in env_config.ENV_KEYS:
+            os.environ[k] = ""
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return False
+
+
+def check_fingerprint_fields_come_from_where_a_real_response_keeps_them() -> bool:
+    """Read off a real response: the docs' abridged examples put the UA at
+    userAgent.value and WebGL at webgl.vendor, and a real response has
+    neither -- a client written from the examples applies nothing."""
+    print("\n--- Fingerprint: fields read from a real API response ---")
+    import fingerprint_client as F
+    fp = _fp_fixture()
+    ok = check("fingerprint: every applied field is found in a real response",
+               F.missing_fields(fp) == [])
+    kw = F.playwright_context_kwargs(fp)
+    ok &= check("fingerprint: user agent from userAgent.userAgent",
+                kw.get("user_agent") == fp["userAgent"]["userAgent"])
+    ok &= check("fingerprint: the response's own locale, not one built from the country",
+                kw.get("locale") == "de-DE")
+    ok &= check("fingerprint: timezone from intl.timeZone", kw.get("timezone_id") == "Europe/Berlin")
+    ok &= check("fingerprint: screen", kw.get("screen") == {"width": 1366, "height": 768})
+    ok &= check("fingerprint: the viewport is the stated outer window, not the screen",
+                kw.get("viewport") == {"width": 1366, "height": 648})
+    ok &= check("fingerprint: device scale factor", kw.get("device_scale_factor") == 1.25)
+    script = F.playwright_init_script(fp)
+    ok &= check("fingerprint: WebGL vendor from glParameters[37445]",
+                json.dumps(fp["webgl"]["glParameters"]["37445"]) in script)
+    ok &= check("fingerprint: WebGL renderer from glParameters[37446]",
+                json.dumps(fp["webgl"]["glParameters"]["37446"]) in script)
+    o = F.user_agent_override(fp)
+    ok &= check("fingerprint: client hints are built", o is not None)
+    if o is None:
+        return False
+    ok &= check("fingerprint: the override carries the same UA",
+                o["userAgent"] == fp["userAgent"]["userAgent"])
+    ok &= check("fingerprint: hint brands",
+                [b["brand"] for b in o["userAgentMetadata"]["brands"]]
+                == ["Not;A=Brand", "Chromium", "Google Chrome"])
+    ok &= check("fingerprint: hint platform", o["userAgentMetadata"]["platform"] == "Windows")
+    ok &= check("fingerprint: hint full version", o["userAgentMetadata"]["fullVersion"] == "150.0.7871.47")
+    ok &= check("fingerprint: Accept-Language from intl.languages", o["acceptLanguage"] == "de-DE,de,en-US,en")
+    ok &= check("fingerprint: navigator.platform", o["platform"] == "Win32")
+    ok &= check("fingerprint: no hints without hint metadata",
+                F.user_agent_override({"userAgent": {"userAgent": "Mozilla/5.0 x"}}) is None)
+    # The read-back comparison: equal values pass, a changed one is named.
+    seen = {"userAgent": kw["user_agent"], "platform": "Win32", "language": "de-DE",
+            "timeZone": "Europe/Berlin", "hardwareConcurrency": 20, "deviceMemory": 16,
+            "uaDataPlatform": "Windows", "screen": [1366, 768],
+            "uaDataBrands": ["Not;A=Brand/8", "Chromium/150", "Google Chrome/150"]}
+    ok &= check("fingerprint: a page reporting the fingerprint has no mismatch",
+                F.readback_mismatches(fp, seen) == [])
+    seen["uaDataBrands"] = ["Chromium/156"]
+    mism = F.readback_mismatches(fp, seen)
+    ok &= check(f"fingerprint: real client hints under a fingerprint UA are a mismatch (got {mism!r})",
+                len(mism) == 1 and mism[0].startswith("uaDataBrands"))
+    return ok
+
+
+class _FpFakeResp:
+    def __init__(self, status, body):
+        self.status_code = status
+        self._body = body
+        self.text = json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+def check_fingerprint_refusal_is_named_and_never_cached_or_leaked() -> bool:
+    """HOME is pointed at an empty directory, so a fingerprint cached by an
+    earlier real run cannot answer instead of the refusal under test."""
+    print("\n--- Fingerprint: API refusal, redaction and the disk cache (HOME isolated) ---")
+    import fingerprint_client as F
+    import requests
+    ok = True
+    key = "0123456789abcdef" * 2
+    calls = []
+    saved_get, saved_home = F.requests.get, os.environ.get("HOME")
+    with tempfile.TemporaryDirectory() as home:
+        os.environ["HOME"] = home
+        try:
+            def refuse(url, params=None, timeout=None):
+                calls.append(params)
+                return _FpFakeResp(403, {"errorId": 2002, "errorCode": "ERROR_FINGERPRINT_PLAN_REQUIRED",
+                                         "errorDescription": "No active fingerprint plan is assigned to this account."})
+            F.requests.get = refuse
+            ok &= check("fingerprint: the cache lives under the CURRENT home",
+                        F.default_cache_dir().startswith(home))
+            try:
+                F.get_fingerprint(key, tags="Windows", country="be")
+                ok &= check("fingerprint: a 403 raises", False)
+            except F.FingerprintError as exc:
+                ok &= check("fingerprint: the refusal names the API's error code",
+                            "ERROR_FINGERPRINT_PLAN_REQUIRED" in str(exc))
+                ok &= check("fingerprint: the refusal never carries the key", key not in str(exc))
+            ok &= check("fingerprint: the request went out (no cache answered)", len(calls) == 1)
+            ok &= check("fingerprint: one tag and the country were sent",
+                        bool(calls) and (calls[0].get("tags"), calls[0].get("country")) == ("Windows", "be"))
+            ok &= check("fingerprint: nothing was cached from a refusal",
+                        not os.path.exists(F.default_cache_dir()))
+
+            def explode(url, params=None, timeout=None):
+                raise requests.ConnectionError(
+                    "HTTPSConnectionPool: /fingerprint/random?format=chromium&key=%s" % key)
+            F.requests.get = explode
+            try:
+                F.get_fingerprint(key, cache_dir=None)
+                ok &= check("fingerprint: a connection error raises", False)
+            except F.FingerprintError as exc:
+                ok &= check("fingerprint: a connection error is redacted",
+                            key not in str(exc) and "key=***" in str(exc))
+            try:
+                F.get_fingerprint(key, tags="Windows,Chrome", cache_dir=None)
+                ok &= check("fingerprint: a tag list is refused before it is billed", False)
+            except F.FingerprintError:
+                ok &= check("fingerprint: a tag list is refused before it is billed", True)
+
+            F.requests.get = lambda url, params=None, timeout=None: _FpFakeResp(200, _fp_fixture())
+            fp = F.get_fingerprint(key, tags="Windows", country="de")
+            F.requests.get = explode
+            again = F.get_fingerprint(key, tags="Windows", country="de")
+            ok &= check("fingerprint: a second run with the same flags is served from the cache",
+                        again.get("id") == fp.get("id"))
+            F.requests.get = lambda url, params=None, timeout=None: _FpFakeResp(200, {"id": 1})
+            try:
+                F.get_fingerprint(key, cache_dir=None)
+                ok &= check("fingerprint: a 200 with no user agent is an error", False)
+            except F.FingerprintError:
+                ok &= check("fingerprint: a 200 with no user agent is an error", True)
+        finally:
+            F.requests.get = saved_get
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+    return ok
+
+
+def check_fingerprint_flags_never_stack_on_the_scraping_browser() -> bool:
+    print("\n--- Fingerprint: flags, never over --cdp-endpoint, other engines refuse ---")
+    import contextlib
+    import io
+    ok = True
+    cdp = "ws://" + "EXAMPLE-LOGIN" + ":" + "EXAMPLE-PASS" + "@cb.2captcha.com:9222"
+    key = ["--twocaptcha-key", "EXAMPLE-KEY"]
+    # The two engines without the flags: argparse refuses them (exit 2). By
+    # source where their driver is absent, by parsing where it is present.
+    for name in ("puppeteer_scraper", "selenium_scraper"):
+        src = open(os.path.join(_HERE, name + ".py"), encoding="utf-8").read()
+        ok &= check(f"{name} defines no --fingerprint and never calls fingerprint_client",
+                    "--fingerprint" not in _extract_flags_from_source(os.path.join(_HERE, name + ".py"))
+                    and "fingerprint_client" not in src)
+    try:
+        import playwright_scraper as P
+    except ImportError as e:
+        return ok & _fp_skip("--fingerprint argument checks", f"playwright absent ({e})")
+    with tempfile.TemporaryDirectory() as tmp, _FpEnvOff():
+        base = ["--url", _SAVERS_URL, "--out", os.path.join(tmp, "o")]
+
+        def parse(argv):
+            with contextlib.redirect_stderr(io.StringIO()), _CapturedOutput():
+                return P.parse_args(base + argv)
+
+        a = parse(["--fingerprint"] + key)
+        ok &= check("--fingerprint parses, no endpoint", a.fingerprint and a.cdp_endpoint is None)
+        ok &= check("--fp-tags defaults to one tag", a.fp_tags == "Windows")
+        for argv, why in ((["--fingerprint", "--cdp-endpoint", cdp] + key, "a typed --cdp-endpoint"),
+                          (["--fingerprint"], "no TWOCAPTCHA_KEY")):
+            try:
+                parse(argv)
+                ok &= check(f"--fingerprint refused with {why}", False)
+            except SystemExit as exc:
+                ok &= check(f"--fingerprint refused with {why} (exit 2)", exc.code == 2)
+        os.environ["ZIMMO_CDP_ENDPOINT"] = cdp
+        b = parse(["--fingerprint"] + key)
+        ok &= check("--fingerprint: an endpoint from the environment is dropped for the run",
+                    b.cdp_endpoint is None)
+        c = parse([])
+        ok &= check("without --fingerprint the environment's endpoint is used", c.cdp_endpoint == cdp)
+        # An endpoint AND a proxy in the environment: the endpoint is dropped
+        # BEFORE the proxy-with-endpoint refusal, so the proxy is kept.
+        os.environ["ZIMMO_PROXY"] = "http://127.0.0.1:" + str(_closed_port())
+        try:
+            d = parse(["--fingerprint"] + key)
+            kept = d.cdp_endpoint is None and bool(d.proxy_urls)
+        except SystemExit:
+            kept = False
+        ok &= check("--fingerprint with endpoint + proxy in the environment keeps the proxy",
+                    kept)
+    return ok
+
+
+def check_fingerprint_facts_reach_the_run_metadata() -> bool:
+    print("\n--- Fingerprint: recorded in the run metadata; a refusal fetches nothing ---")
+    from unittest import mock
+    from output_writer import Product, finish_run
+    ok = True
+    facts = {"id": 5573997, "client_hints": True, "mismatches": []}
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "o")
+        with _CapturedOutput():
+            finish_run([Product(sku="A", url="u")], out, "json", pages_requested=1,
+                       pages_completed=1, fingerprint=facts)
+            finish_run([Product(sku="A", url="u")], out + "2", "json", pages_requested=1,
+                       pages_completed=1)
+        meta = json.load(open(out + ".meta.json", encoding="utf-8"))
+        meta2 = json.load(open(out + "2.meta.json", encoding="utf-8"))
+        ok &= check("finish_run records the fingerprint facts",
+                    meta.get("fingerprint", {}).get("id") == 5573997)
+        ok &= check("no fingerprint key without --fingerprint", "fingerprint" not in meta2)
+    try:
+        import playwright_scraper as P
+    except ImportError as e:
+        return ok & _fp_skip("--fingerprint through scrape()", f"playwright absent ({e})")
+    import fingerprint_client as F
+    with tempfile.TemporaryDirectory() as tmp, _FpEnvOff():
+        out = os.path.join(tmp, "o")
+        argv = ["--url", _SAVERS_URL, "--out", out, "--format", "json",
+                "--fingerprint", "--twocaptcha-key", "EXAMPLE-KEY"]
+        fetched = []
+
+        def fake_fetch(url, page_num, args, *a, **k):
+            fetched.append(page_num)
+            return ([Product(sku="P1", url="u1")], True, False, False, False)
+        with _CapturedOutput():
+            args = P.parse_args(argv)
+        with mock.patch.object(F, "get_fingerprint", lambda *a, **k: _fp_fixture()), \
+                mock.patch.object(P, "_fetch_page", side_effect=fake_fetch), _CapturedOutput():
+            rc = P.scrape(args)
+        meta = json.load(open(out + ".meta.json", encoding="utf-8")) \
+            if os.path.exists(out + ".meta.json") else {}
+        ok &= check(f"scrape(): the fingerprint fetched is in <out>.meta.json (rc {rc})",
+                    rc == 0 and meta.get("fingerprint", {}).get("id") == 5573997
+                    and meta["fingerprint"].get("user_agent") == _fp_fixture()["userAgent"]["userAgent"])
+
+        def refuse(*a, **k):
+            raise F.FingerprintError("Fingerprint API refused the key (403: "
+                                     "ERROR_FINGERPRINT_PLAN_REQUIRED)")
+        out2 = os.path.join(tmp, "refused")
+        with _CapturedOutput():
+            args = P.parse_args(argv[:3] + [out2] + argv[4:])
+        fetched.clear()
+        with mock.patch.object(F, "get_fingerprint", refuse), \
+                mock.patch.object(P, "_fetch_page", side_effect=fake_fetch), _CapturedOutput():
+            rc = P.scrape(args)
+        attempt = json.load(open(out2 + ".latest_attempt.meta.json", encoding="utf-8")) \
+            if os.path.exists(out2 + ".latest_attempt.meta.json") else {}
+        ok &= check("a Fingerprint API refusal exits 5 before any page is fetched, and writes "
+                    "no <out>.meta.json",
+                    rc == 5 and not fetched and not os.path.exists(out2 + ".meta.json")
+                    and attempt.get("stop_reason") == "fingerprint_api_error")
+    return ok
+
+
+def check_fingerprint_is_applied_to_a_real_local_chromium() -> bool:
+    """Launches the installed Chromium through the engine's own page attempt
+    with the fixture fingerprint, against a loopback server, and reads back
+    what the page and the request headers report."""
+    print("\n--- Fingerprint: applied to a real local Chromium (loopback) ---")
+    try:
+        import playwright_scraper as P
+    except ImportError as e:
+        return _fp_skip("fingerprint on a real Chromium", f"playwright absent ({e})")
+    import http.server
+    import threading
+    from unittest import mock
+    import fingerprint_client as F
+    seen_headers = {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen_headers.update({k.lower(): v for k, v in self.headers.items()})
+            body = b"<html><body>ok</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d/" % srv.server_port
+    fp = _fp_fixture()
+    ok = True
+    try:
+        with tempfile.TemporaryDirectory() as tmp, _FpEnvOff():
+            with _CapturedOutput():
+                args = P.parse_args(["--url", _SAVERS_URL, "--out", os.path.join(tmp, "o"),
+                                     "--retries", "0", "--fingerprint",
+                                     "--twocaptcha-key", "EXAMPLE-KEY"])
+            with mock.patch.object(F, "get_fingerprint", lambda *a, **k: fp), \
+                    mock.patch.object(P, "_wait_for_listing_markers", lambda *a, **k: False), \
+                    mock.patch.object(P, "handle_captcha_if_present", lambda *a, **k: False), \
+                    _CapturedOutput() as log:
+                P._fingerprint(args)
+                P._fetch_page_attempts(url, 1, args, None, 0, None, None)
+            facts = getattr(args, "fp_facts", None) or {}
+            if not seen_headers:
+                return _fp_skip("fingerprint on a real Chromium",
+                                "no request reached the loopback server (cannot launch? "
+                                + log.getvalue().strip().splitlines()[-1][:120] + ")"
+                                if log.getvalue().strip() else "no log")
+            ok &= check(f"live: the page reports every checked fingerprint field "
+                        f"(mismatches {facts.get('mismatches')!r})", facts.get("mismatches") == [])
+            ok &= check("live: client hints were set", facts.get("client_hints") is True)
+            ok &= check("live: User-Agent header is the fingerprint's",
+                        seen_headers.get("user-agent") == fp["userAgent"]["userAgent"])
+            ok &= check(f"live: Sec-CH-UA names the fingerprint's Chrome "
+                        f"(got {seen_headers.get('sec-ch-ua')!r})",
+                        '"Google Chrome";v="150"' in seen_headers.get("sec-ch-ua", ""))
+            ok &= check("live: Sec-CH-UA-Platform", seen_headers.get("sec-ch-ua-platform") == '"Windows"')
+            ok &= check(f"live: Accept-Language from the fingerprint "
+                        f"(got {seen_headers.get('accept-language')!r})",
+                        seen_headers.get("accept-language", "").startswith("de-DE"))
+    finally:
+        srv.shutdown()
+    return ok
+
+
 if __name__ == "__main__":
     classify_ok = check_classify_page_contract()
     engines_classify_ok = check_engines_use_shared_page_classification()
@@ -3097,6 +3456,13 @@ if __name__ == "__main__":
         check_proxy_meter_in_a_real_browser(),
         check_canary_reports_proxy_traffic(),
     ])
+    fingerprint_ok = all([
+        check_fingerprint_fields_come_from_where_a_real_response_keeps_them(),
+        check_fingerprint_refusal_is_named_and_never_cached_or_leaked(),
+        check_fingerprint_flags_never_stack_on_the_scraping_browser(),
+        check_fingerprint_facts_reach_the_run_metadata(),
+        check_fingerprint_is_applied_to_a_real_local_chromium(),
+    ])
     exit_code = main()
     overall_ok = (wording_ok and env_ok and env_roundtrip_ok and credentials_ok
                   and engine_import_ok and ast_ok and flags_ok and signatures_ok
@@ -3105,6 +3471,6 @@ if __name__ == "__main__":
                   and epc_regression_ok and css_fallback_scope_ok and live_tiles_ok and item_link_selector_ok
                   and unattempted_ok and no_sku_dedup_ok and audit_2026_10_07_ok
                   and schema_ok and canary_gate_ok and audit_2026_10_14_ok
-                  and proxy_meter_ok
+                  and proxy_meter_ok and fingerprint_ok
                   and exit_code == 0)
     sys.exit(0 if overall_ok else 1)

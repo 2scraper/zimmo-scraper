@@ -1,233 +1,544 @@
+#!/usr/bin/env python3
 """
 fingerprint_client.py
------------------
-2Captcha fingerprint fetch + application. No site knowledge -- shared
-verbatim across the 2scraper family.
+---------------------
+Client for 2Captcha's Fingerprint API (https://2captcha.com/fingerprints/api),
+plus the builders that turn one response into settings for a Chromium this
+project LAUNCHED ITSELF.
 
-**UNCONFIRMED against a real, current 2Captcha fingerprint API
-response** -- unlike this family's Scraping Browser API integration
-(whose CDP endpoint shape IS confirmed live). The endpoint path and field names below are a
-best-effort structure, not verified against real API docs. **Confirm
-`FINGERPRINT_API_URL` and every field name below before depending on
-this in a live run.**
+Never applied over `--cdp-endpoint`: the Scraping Browser API brings its own
+fingerprint, and a second one stacked on a remote browser is a contradiction,
+not better cover. The engine refuses a typed `--cdp-endpoint` together with
+`--fingerprint`, and ignores (with a notice) an endpoint that only came from
+`.env`.
 
-SIX real, repeated bugs were found in this exact
-module across four sibling repos, all invisible to import/--help/
-compileall/the offline suite/CI, none of them raising -- "the tool
-does less than it says while reporting success". Addressed here from
-the start rather than discovered later:
+API surface used (docs re-read 2026-11-05)
+------------------------------------------
+  GET https://api.2captcha.com/fingerprint/random
+  GET https://api.2captcha.com/fingerprint/generate
+    key       the API key, as a query parameter
+    format    "chromium" (default) | "raw"
+    tags      OS/browser filter, e.g. "Windows"
+    country   ISO 3166-1 alpha-2
+    min_browser_version / browser_version / build_version (generate only)
+  Errors: {"errorId", "errorCode", "errorDescription"}, e.g. 403
+  ERROR_FINGERPRINT_PLAN_REQUIRED — fingerprints are a separate subscription,
+  and a key with a working captcha balance is refused without one.
 
-  1. **The API key printed to the terminal on any error.** `requests`
-     puts the full URL into HTTPError/connection-error text; this
-     module's own `key` rides in the JSON body (not a query string) for
-     the one call it makes, which is lower risk than the family's other
-     known leak points -- but `redact_secret_patterns()` is still
-     applied to every logged exception here, defensively, since "lower
-     risk" is not "no risk" and a leaked key is the worst
-     bug class this family has had.
-  2. **`--fingerprint`/the client never actually setting a user agent**
-     (a key the API returns in neither format the code checked for).
-     Addressed by trying multiple plausible field-name shapes
-     (`user_agent`, `userAgent`) rather than one guessed name, and by
-     `apply_profile_or_warn()` below, which LOGS what it actually set
-     rather than assuming success.
-  3. **Locale built as `en-{country}`** (`en-DE` for a German
-     fingerprint) instead of reading the API's own locale field. This
-     client never constructs a locale from a country code -- it only
-     ever uses `data.get("locale", ...)` verbatim, so this specific
-     malformation cannot occur here BY CONSTRUCTION; noted so a future
-     edit doesn't reintroduce it.
-  4. **Timezone never applied at all, though the API states it.** This
-     module is honest that it is **not currently wired into any
-     engine's browser-launch path** -- `fetch_fingerprint()` and the
-     `*_context_options()`/`*_apply_kwargs()` functions below exist and
-     are tested, but no engine script calls them yet. See the README's
-     "confirmed live" section: applying a fingerprint (including its
-     timezone) is a documented gap, not a silent one.
-  5. **A documented `--tags`-style flag rejecting every value except
-     one exact case.** This module has no `--tags` flag of its own (the
-     engines do not currently expose a `--fingerprint`/`--fp-tags` flag
-     at all -- see point 4), so the specific failure mode does not
-     apply here; noted so adding such a flag later checks the real API
-     constraint first rather than guessing a default.
-  6. **A Docker image that failed on every invocation.** Not this
-     file's concern directly -- see the repo's Dockerfile and the
-     `docker-build` CI job, which actually builds and runs the image
-     rather than trusting a manual COPY-list review.
+`tags` is sent as ONE value. The docs show repeated `tags=` parameters as
+well; that form has not been verified from this repository, and the list
+forms tried earlier (comma, pipe) were answered with HTTP 400. Some single
+tags contain a space ("Microsoft Windows", "Apple Mac").
 
-Captcha solving, the Scraping Browser API, proxies and fingerprints are
-four SEPARATELY-BILLED 2Captcha products behind one API key. Never integrate a competitor's fingerprinting product here.
+Where a `chromium` response keeps each value (field names read from real
+responses of 2026-09-21 and 2026-09-30, kept trimmed in
+fixtures/fingerprint_chromium.json; the docs' examples are abridged and do
+not agree with each other on `userAgent`):
+
+  user agent        userAgent.userAgent            (docs example: userAgent.value)
+  client hints      userAgent.{brandVersionList, brandFullVersionList,
+                    fullVersion, platform, platformVersion, architecture,
+                    bitness, model, mobile, wow64, formFactors}
+  locale/languages  intl.contentLocale, intl.languages
+  timezone          intl.timeZone
+  screen            screen.{width, height, outerWidth, outerHeight,
+                    deviceScaleFactor}
+  navigator         navigator.{platform, hardwareConcurrency, deviceMemory,
+                    maxTouchPoints}
+  WebGL strings     webgl.glParameters["37445"/"37446"]  (UNMASKED_VENDOR /
+                    UNMASKED_RENDERER; docs example: webgl.vendor/renderer)
+
+Every field this module cannot find is reported by name (`describe()`,
+`--explain`), never silently skipped: a fingerprint that was billed and then
+applied to nothing looks exactly like one that worked.
+
+What is applied, and how deep
+-----------------------------
+* Context options (native in Playwright): user agent, locale, timezone,
+  viewport, screen, device scale factor.
+* `Emulation.setUserAgentOverride` over a CDP session: the same user agent
+  WITH its client hints, so `Sec-CH-UA*` headers and
+  `navigator.userAgentData` agree with the `User-Agent` header. A bare UA
+  override leaves the real Chromium's hints in place, which is a
+  contradiction any server can read.
+* An init script for what neither can set: navigator.platform /
+  hardwareConcurrency / deviceMemory / maxTouchPoints and the two WebGL
+  debug strings. Shallow by construction: it changes what is REPORTED, not
+  what the GPU renders, and the engine underneath is still the installed
+  Chromium (a fingerprint may name another Chrome version).
+
+Usage
+-----
+    python3 fingerprint_client.py --tags Windows --country be --explain
+
+    # in an engine (see playwright_scraper.py):
+    fp = get_fingerprint(key, tags="Windows", country="be")
+    context = browser.new_context(**playwright_context_kwargs(fp))
+    context.add_init_script(playwright_init_script(fp))
+    page = context.new_page()
+    override = user_agent_override(fp)
+    if override:
+        context.new_cdp_session(page).send("Emulation.setUserAgentOverride", override)
+    ... page.goto(url) ...
+    mismatches = readback_mismatches(fp, page.evaluate(READBACK_JS))
+
+Requires: pip install -r requirements.txt
 """
 
+from __future__ import annotations
+
+import argparse
+import hashlib
 import json
 import logging
-from dataclasses import dataclass, field
+import os
+import re
+import sys
 from typing import Any, Dict, List, Optional
 
 import requests
 
-from proxy_pool import redact_secret_patterns
-
 logger = logging.getLogger("fingerprint_client")
 
-# UNCONFIRMED -- see module docstring.
-FINGERPRINT_API_URL = "https://api.2captcha.com/fingerprint/generate"
+API_BASE = "https://api.2captcha.com"
+RANDOM_URL = f"{API_BASE}/fingerprint/random"
+GENERATE_URL = f"{API_BASE}/fingerprint/generate"
+
+# Resolved at CALL time, not import time, so a test that points HOME at a
+# temporary directory really gets an empty cache (a cached fingerprint would
+# otherwise hide the refusal path).
+def default_cache_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".cache", "2captcha-fingerprints")
 
 
-@dataclass
-class FingerprintProfile:
-    """UNCONFIRMED field names -- see module docstring. Grouped by what
-    each field is used for, so a real API response can be mapped onto
-    (or correct) this shape field by field rather than needing a
-    rewrite."""
-    user_agent: str
-    platform: str
-    locale: str
-    timezone_id: str
-    viewport_width: int
-    viewport_height: int
-    screen_width: int
-    screen_height: int
-    color_depth: int = 24
-    hardware_concurrency: int = 4
-    device_memory: int = 8
-    webgl_vendor: Optional[str] = None
-    webgl_renderer: Optional[str] = None
-    fonts: List[str] = field(default_factory=list)
-    raw: Dict[str, Any] = field(default_factory=dict)
+DEFAULT_TAGS = "Windows"
+
+# The key rides in the query string, and `requests` copies the full URL into
+# the text of every error it raises. Everything raised from here goes through
+# this first; the endpoint and status survive, the key does not.
+_KEY_IN_TEXT_RE = re.compile(
+    r"((?:client)?key|token|api[_-]?key)=([^&\s'\"]{6,})", re.IGNORECASE)
 
 
-def _first_present(data: dict, *keys: str, default=None):
-    """Try several plausible field-name shapes in order -- bug #2 above was exactly one guessed key name failing silently
-    against a real response shaped differently. Trying several is
-    still a guess, but a narrower one, and `raw` is kept on the
-    returned profile so a real response can be inspected directly."""
-    for key in keys:
-        if key in data and data[key] is not None:
-            return data[key]
-    return default
+def _redact(text) -> str:
+    return _KEY_IN_TEXT_RE.sub(r"\1=***", str(text))
 
 
-def fetch_fingerprint(api_key: str, *, os_name: str = "windows",
-                       browser: str = "chrome", country: Optional[str] = None,
-                       timeout: int = 15) -> Optional[FingerprintProfile]:
-    """Fetch one fingerprint profile. Returns None (with a logged
-    warning, never a raised exception) on any failure -- a missing
-    fingerprint should degrade to the engine's own default fingerprint,
-    not crash a run that would otherwise have worked fine.
+class FingerprintError(RuntimeError):
+    """The Fingerprint API refused or failed. A remote-API error (exit 5 in
+    the engines), not a crash: the message says why, already redacted."""
 
-    UNCONFIRMED against a real API response -- see module docstring.
-    """
+
+def _cache_path(cache_dir: str, params: dict, generate: bool) -> str:
+    key = json.dumps({"generate": generate, **params}, sort_keys=True)
+    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+    return os.path.join(cache_dir, f"{digest}.json")
+
+
+def _api_error(resp) -> str:
     try:
-        resp = requests.post(
-            FINGERPRINT_API_URL,
-            json={"key": api_key, "os": os_name, "browser": browser, "country": country},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except (requests.RequestException, json.JSONDecodeError) as e:
-        # Bug #1 above: redact defensively even though this
-        # call's own key rides in the JSON body, not a query string --
-        # "lower risk" is not "no risk", and this is the exact bug class
-        # a leaked key is the worst bug class this family has had.
-        logger.warning("fingerprint_client: could not fetch a fingerprint (%s) -- "
-                        "continuing with the engine's own default fingerprint instead.",
-                        redact_secret_patterns(str(e)))
-        return None
-
-    user_agent = _first_present(data, "user_agent", "userAgent")
-    if not user_agent:
-        logger.warning("fingerprint_client: response had no recognisable user-agent field "
-                        "(tried 'user_agent', 'userAgent') -- this API's response shape may "
-                        "have changed since this client was written (see module docstring: "
-                        "UNCONFIRMED). Continuing with the engine's own default fingerprint.")
-        return None
-
-    viewport = data.get("viewport", {}) or {}
-    screen = data.get("screen", {}) or {}
-    webgl = data.get("webgl", {}) or {}
-
-    return FingerprintProfile(
-        user_agent=user_agent,
-        platform=data.get("platform", "Win32"),
-        # Read the API's OWN locale field verbatim -- never construct
-        # one from a country code (bug #3 above: "en-{country}"
-        # for a German fingerprint is a malformation this shape cannot
-        # produce, by construction, as long as this stays a straight
-        # dict read).
-        locale=data.get("locale", "en-US"),
-        timezone_id=data.get("timezone", "Europe/Brussels"),
-        viewport_width=viewport.get("width", 1920),
-        viewport_height=viewport.get("height", 1080),
-        screen_width=screen.get("width", 1920),
-        screen_height=screen.get("height", 1080),
-        color_depth=screen.get("colorDepth", 24),
-        hardware_concurrency=data.get("hardware_concurrency", 4),
-        device_memory=data.get("device_memory", 8),
-        webgl_vendor=webgl.get("vendor"),
-        webgl_renderer=webgl.get("renderer"),
-        fonts=data.get("fonts", []),
-        raw=data,
-    )
+        body = resp.json()
+    except ValueError:
+        return _redact(resp.text[:200])
+    if isinstance(body, dict):
+        code = body.get("errorCode") or ""
+        desc = body.get("errorDescription") or ""
+        return _redact(("%s %s" % (code, desc)).strip() or str(body)[:200])
+    return _redact(str(body)[:200])
 
 
-def playwright_context_options(profile: FingerprintProfile) -> Dict[str, Any]:
-    """Options for playwright.chromium.launch().new_context(**options).
-    Every key here is confirmed against a real, installed Playwright's
-    own Browser.new_context() signature via inspect.signature() --
-    see tests/test_fingerprint_kwargs.py (a paid API's kwargs must be
-    ones the driver accepts).
+def get_fingerprint(api_key: str, *, tags: Optional[str] = DEFAULT_TAGS,
+                    country: Optional[str] = None,
+                    min_browser_version: Optional[int] = None,
+                    browser_version: Optional[int] = None,
+                    build_version: Optional[str] = None,
+                    fmt: str = "chromium", generate: bool = False,
+                    cache_dir: Optional[str] = "default",
+                    refresh: bool = False, timeout: int = 30) -> dict:
+    """Fetch one fingerprint. Cached on disk unless cache_dir is None.
 
-    Never call this when connecting via --cdp-endpoint:
-    the Scraping Browser brings its own fingerprint, and stacking a
-    second on top creates a contradiction rather than better cover."""
-    return {
-        "user_agent": profile.user_agent,
-        "viewport": {"width": profile.viewport_width, "height": profile.viewport_height},
-        "screen": {"width": profile.screen_width, "height": profile.screen_height},
-        "locale": profile.locale,
-        "timezone_id": profile.timezone_id,
-        "device_scale_factor": 1,
-    }
-
-
-def playwright_init_script(profile: FingerprintProfile) -> str:
-    """A page.add_init_script() body overriding navigator.hardwareConcurrency
-    / deviceMemory and (best-effort) the WebGL vendor/renderer strings.
-    UNCONFIRMED against a real detector's expectations."""
-    webgl_patch = ""
-    if profile.webgl_vendor and profile.webgl_renderer:
-        webgl_patch = f"""
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {{
-            if (parameter === 37445) return {json.dumps(profile.webgl_vendor)};
-            if (parameter === 37446) return {json.dumps(profile.webgl_renderer)};
-            return getParameter.call(this, parameter);
-        }};
-        """
-    return f"""
-    Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {profile.hardware_concurrency} }});
-    Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {profile.device_memory} }});
-    Object.defineProperty(navigator, 'platform', {{ get: () => {json.dumps(profile.platform)} }});
-    {webgl_patch}
+    Cached because both endpoints are billed per successful response and
+    capped per minute: an uncached call per run turns into a bill, and per
+    page into rate-limit errors. The cache key is the request, so the same
+    flags give the same identity until --refresh.
     """
+    if not api_key:
+        raise FingerprintError("no API key: the Fingerprint API uses TWOCAPTCHA_KEY")
+    if tags and any(sep in tags for sep in (",", "|")):
+        raise FingerprintError(
+            "tags=%r is a list; send ONE value such as Windows (lists were "
+            "answered with HTTP 400)" % tags)
+    params: Dict[str, Any] = {"format": fmt}
+    if tags:
+        params["tags"] = tags
+    if country:
+        params["country"] = country.lower()
+    if min_browser_version:
+        params["min_browser_version"] = min_browser_version
+    if browser_version:
+        params["browser_version"] = browser_version
+    if build_version:
+        if not generate:
+            raise FingerprintError("build_version is only accepted by /fingerprint/generate")
+        params["build_version"] = build_version
+
+    if cache_dir == "default":
+        cache_dir = default_cache_dir()
+    if cache_dir:
+        path = _cache_path(cache_dir, params, generate)
+        if os.path.exists(path) and not refresh:
+            with open(path, encoding="utf-8") as f:
+                fp = json.load(f)
+            logger.info("Using cached fingerprint %s (%s)", fp.get("id"), path)
+            return fp
+
+    url = GENERATE_URL if generate else RANDOM_URL
+    logger.info("GET %s %s", url, params)
+    try:
+        resp = requests.get(url, params={**params, "key": api_key}, timeout=timeout)
+    except requests.RequestException as exc:
+        raise FingerprintError("Fingerprint API request failed: %s" % _redact(exc)) from None
+
+    if resp.status_code in (401, 403):
+        # Measured 2026-11-05 with a key that has a captcha balance:
+        # 403 ERROR_FINGERPRINT_PLAN_REQUIRED.
+        raise FingerprintError(
+            "Fingerprint API refused the key (%s: %s). Fingerprints are a "
+            "separate subscription from captcha solving." % (resp.status_code, _api_error(resp)))
+    if resp.status_code == 400:
+        raise FingerprintError("Fingerprint API rejected the request (400: %s); sent %s"
+                               % (_api_error(resp), params))
+    if resp.status_code == 429:
+        raise FingerprintError("Fingerprint API rate limit (429: %s). The per-minute cap "
+                               "depends on the plan; the disk cache avoids refetching."
+                               % _api_error(resp))
+    if resp.status_code != 200:
+        raise FingerprintError("Fingerprint API answered %s: %s"
+                               % (resp.status_code, _api_error(resp)))
+    try:
+        fp = resp.json()
+    except ValueError:
+        raise FingerprintError("Fingerprint API answered 200 with a body that is not JSON") from None
+    if not isinstance(fp, dict) or not fingerprint_user_agent(fp):
+        raise FingerprintError("Fingerprint API answered 200 without a user agent; "
+                               "nothing could be applied (keys: %s)"
+                               % (sorted(fp)[:12] if isinstance(fp, dict) else type(fp).__name__))
+
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(_cache_path(cache_dir, params, generate), "w", encoding="utf-8") as f:
+            json.dump(fp, f, indent=2)
+    logger.info("Fingerprint %s (%s)", fp.get("id"), fp.get("country"))
+    return fp
 
 
-def pyppeteer_apply_kwargs(profile: FingerprintProfile) -> Dict[str, Any]:
-    """Kwargs for pyppeteer.launch() plus a page.setUserAgent() /
-    page.setViewport() call the caller still needs to make explicitly."""
-    return {
-        "args": [f"--lang={profile.locale}"],
+# --- reading a response -----------------------------------------------------
+
+def _walk(fp, path):
+    node = fp
+    for key in path:
+        if isinstance(node, dict) and key in node:
+            node = node[key]
+        elif isinstance(node, list) and isinstance(key, int) and -len(node) <= key < len(node):
+            node = node[key]
+        else:
+            return None
+    return node
+
+
+def _pick(fp: dict, *paths):
+    """First non-empty scalar at any of `paths`, and the path it came from."""
+    for path in paths:
+        node = _walk(fp, path)
+        if isinstance(node, bool) or (isinstance(node, (str, int, float)) and str(node).strip()):
+            return node, ".".join(str(p) for p in path)
+    return None, None
+
+
+FIELDS = {
+    "user_agent": [("userAgent", "userAgent"), ("userAgent", "value"), ("userAgent",),
+                   ("navigator", "userAgent"), ("data", "ua")],
+    "locale": [("intl", "contentLocale"), ("intl", "languages", 0)],
+    "timezone": [("intl", "timeZone")],
+    "screen_width": [("screen", "width"), ("screen", "screenRect", "width")],
+    "screen_height": [("screen", "height"), ("screen", "screenRect", "height")],
+    "outer_width": [("screen", "outerWidth")],
+    "outer_height": [("screen", "outerHeight")],
+    "device_scale_factor": [("screen", "deviceScaleFactor")],
+    "platform": [("navigator", "platform")],
+    "hardware_concurrency": [("navigator", "hardwareConcurrency")],
+    "device_memory": [("navigator", "deviceMemory")],
+    "max_touch_points": [("navigator", "maxTouchPoints")],
+    "webgl_vendor": [("webgl", "glParameters", "37445"), ("webgl", "vendor")],
+    "webgl_renderer": [("webgl", "glParameters", "37446"), ("webgl", "renderer")],
+    "ch_full_version": [("userAgent", "fullVersion")],
+    "ch_platform": [("userAgent", "platform")],
+}
+
+
+def describe(fp: dict) -> Dict[str, Dict[str, Any]]:
+    """Every field this module applies: its value and the response path it
+    came from (None, None when the response has no such field)."""
+    out = {}
+    for name, paths in FIELDS.items():
+        value, source = _pick(fp, *paths)
+        out[name] = {"value": value, "from": source}
+    out["languages"] = {"value": languages(fp), "from": "intl.languages" if languages(fp) else None}
+    return out
+
+
+def fingerprint_user_agent(fp: dict) -> Optional[str]:
+    value, _ = _pick(fp, *FIELDS["user_agent"])
+    return str(value) if value else None
+
+
+def languages(fp: dict) -> List[str]:
+    langs = _walk(fp, ("intl", "languages"))
+    return [str(x) for x in langs if x] if isinstance(langs, list) else []
+
+
+def missing_fields(fp: dict) -> List[str]:
+    return [name for name, v in describe(fp).items() if v["value"] in (None, [], "")]
+
+
+# --- builders ---------------------------------------------------------------
+
+def playwright_context_kwargs(fp: dict) -> dict:
+    """Options for Browser.new_context taken from the fingerprint itself.
+
+    Nothing is derived: no locale invented from a country (a German
+    fingerprint is not `en-DE`), no viewport equal to the screen when the
+    response states its own outer window size.
+    """
+    d = describe(fp)
+    kwargs: Dict[str, Any] = {}
+    if d["user_agent"]["value"]:
+        kwargs["user_agent"] = str(d["user_agent"]["value"])
+    if d["locale"]["value"]:
+        kwargs["locale"] = str(d["locale"]["value"])
+    if d["timezone"]["value"]:
+        kwargs["timezone_id"] = str(d["timezone"]["value"])
+    w, h = d["screen_width"]["value"], d["screen_height"]["value"]
+    if w and h:
+        w, h = int(w), int(h)
+        kwargs["screen"] = {"width": w, "height": h}
+        ow = int(d["outer_width"]["value"] or w)
+        oh = int(d["outer_height"]["value"] or max(400, h - 120))
+        kwargs["viewport"] = {"width": min(ow, w), "height": max(400, min(oh, h))}
+    dsf = d["device_scale_factor"]["value"]
+    if dsf:
+        try:
+            kwargs["device_scale_factor"] = float(dsf)
+        except (TypeError, ValueError):
+            pass
+    return kwargs
+
+
+def _brands(items) -> List[Dict[str, str]]:
+    out = []
+    for b in items or []:
+        if isinstance(b, dict) and b.get("brand") is not None and b.get("version") is not None:
+            out.append({"brand": str(b["brand"]), "version": str(b["version"])})
+    return out
+
+
+def user_agent_override(fp: dict) -> Optional[dict]:
+    """Parameters for CDP `Emulation.setUserAgentOverride`: the user agent
+    together with its client hints, so the `Sec-CH-UA*` request headers and
+    `navigator.userAgentData` describe the same browser as `User-Agent`.
+
+    None when the response carries no hint metadata: sending the UA alone
+    would add nothing over the context option.
+    """
+    ua = fingerprint_user_agent(fp)
+    meta_src = fp.get("userAgent") if isinstance(fp.get("userAgent"), dict) else None
+    if not ua or not meta_src or not meta_src.get("brandVersionList"):
+        return None
+    meta: Dict[str, Any] = {
+        "brands": _brands(meta_src.get("brandVersionList")),
+        "fullVersionList": _brands(meta_src.get("brandFullVersionList")),
+        "fullVersion": str(meta_src.get("fullVersion") or ""),
+        "platform": str(meta_src.get("platform") or ""),
+        "platformVersion": str(meta_src.get("platformVersion") or ""),
+        "architecture": str(meta_src.get("architecture") or ""),
+        "model": str(meta_src.get("model") or ""),
+        "mobile": bool(meta_src.get("mobile")),
+        "bitness": str(meta_src.get("bitness") or ""),
+        "wow64": bool(meta_src.get("wow64")),
     }
+    if isinstance(meta_src.get("formFactors"), list):
+        meta["formFactors"] = [str(x) for x in meta_src["formFactors"]]
+    params: Dict[str, Any] = {"userAgent": ua, "userAgentMetadata": meta}
+    langs = languages(fp)
+    if langs:
+        params["acceptLanguage"] = ",".join(langs)
+    platform, _ = _pick(fp, *FIELDS["platform"])
+    if platform:
+        params["platform"] = str(platform)
+    return params
 
 
-def selenium_chrome_options(profile: FingerprintProfile):
-    """Best-effort only -- Selenium's own fingerprint surface is
-    narrower than Playwright's (no native context-level UA/viewport/
-    timezone override). Returns what CAN be set at launch time."""
-    from selenium.webdriver.chrome.options import Options
-    options = Options()
-    options.add_argument(f"--lang={profile.locale}")
-    options.add_argument(f"--window-size={profile.viewport_width},{profile.viewport_height}")
-    return options
+def playwright_init_script(fp: dict) -> str:
+    """JS run before page scripts for what no context option or CDP override
+    sets. Values are embedded as JSON, so a string from the API cannot end
+    the script it sits in."""
+    d = describe(fp)
+    payload = json.dumps({
+        "platform": d["platform"]["value"],
+        "hardwareConcurrency": d["hardware_concurrency"]["value"],
+        "deviceMemory": d["device_memory"]["value"],
+        "maxTouchPoints": d["max_touch_points"]["value"],
+        "webglVendor": d["webgl_vendor"]["value"],
+        "webglRenderer": d["webgl_renderer"]["value"],
+    })
+    return """
+(() => {
+  const fp = %s;
+  const def = (obj, prop, value) => {
+    if (value === null || value === undefined) return;
+    try { Object.defineProperty(obj, prop, {get: () => value, configurable: true}); }
+    catch (e) { /* non-configurable: leave it rather than throw */ }
+  };
+  def(Navigator.prototype, 'platform', fp.platform);
+  def(Navigator.prototype, 'hardwareConcurrency', fp.hardwareConcurrency);
+  def(Navigator.prototype, 'deviceMemory', fp.deviceMemory);
+  def(Navigator.prototype, 'maxTouchPoints', fp.maxTouchPoints);
+  // 37445 = UNMASKED_VENDOR_WEBGL, 37446 = UNMASKED_RENDERER_WEBGL; WebGL1 and 2.
+  for (const ctor of [window.WebGLRenderingContext, window.WebGL2RenderingContext]) {
+    if (!ctor) continue;
+    const original = ctor.prototype.getParameter;
+    ctor.prototype.getParameter = function (p) {
+      if (p === 37445 && fp.webglVendor) return fp.webglVendor;
+      if (p === 37446 && fp.webglRenderer) return fp.webglRenderer;
+      return original.apply(this, arguments);
+    };
+  }
+})();
+""" % payload
+
+
+# --- reading it back from a live page ----------------------------------------
+
+# A function expression, evaluated as one (Playwright's page.evaluate).
+READBACK_JS = """() => ({
+  userAgent: navigator.userAgent,
+  platform: navigator.platform,
+  language: navigator.language,
+  languages: Array.from(navigator.languages || []),
+  timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  hardwareConcurrency: navigator.hardwareConcurrency,
+  deviceMemory: navigator.deviceMemory,
+  screen: [screen.width, screen.height],
+  uaDataBrands: navigator.userAgentData
+      ? navigator.userAgentData.brands.map(b => b.brand + '/' + b.version) : null,
+  uaDataPlatform: navigator.userAgentData ? navigator.userAgentData.platform : null,
+})"""
+
+
+def readback_mismatches(fp: dict, seen: dict) -> List[str]:
+    """What the live page reports that differs from the fingerprint.
+    Empty means every checked field was applied."""
+    d = describe(fp)
+    want = {
+        "userAgent": d["user_agent"]["value"],
+        "platform": d["platform"]["value"],
+        "language": d["locale"]["value"],
+        "timeZone": d["timezone"]["value"],
+        "hardwareConcurrency": d["hardware_concurrency"]["value"],
+        "deviceMemory": d["device_memory"]["value"],
+        "uaDataPlatform": d["ch_platform"]["value"],
+    }
+    if d["screen_width"]["value"] and d["screen_height"]["value"]:
+        want["screen"] = [int(d["screen_width"]["value"]), int(d["screen_height"]["value"])]
+    brands = _brands(_walk(fp, ("userAgent", "brandVersionList")))
+    if brands:
+        want["uaDataBrands"] = ["%s/%s" % (b["brand"], b["version"]) for b in brands]
+    out = []
+    for key, value in want.items():
+        if value is None:
+            continue
+        got = seen.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            ok = got is not None and float(got) == float(value)
+        else:
+            ok = got == value
+        if not ok:
+            out.append("%s: page %r, fingerprint %r" % (key, got, value))
+    return out
+
+
+# --- engine glue: flags -----------------------------------------------------
+
+def add_arguments(parser) -> None:
+    """The engine flags. Defined here once so a port copies one function."""
+    g = parser.add_argument_group("2Captcha fingerprint (local browser only)")
+    g.add_argument("--fingerprint", action="store_true",
+                   help="Fetch a fingerprint from the 2Captcha Fingerprint API "
+                        "(TWOCAPTCHA_KEY; a separate subscription) and apply it "
+                        "to the locally launched Chromium. Not combinable with "
+                        "a typed --cdp-endpoint; an endpoint from .env is "
+                        "ignored for the run.")
+    g.add_argument("--fp-tags", default=DEFAULT_TAGS, metavar="TAG",
+                   help="ONE OS-family tag (default: %(default)s).")
+    g.add_argument("--fp-country", default=None, metavar="CC",
+                   help="Fingerprint country, ISO 3166-1 alpha-2. Match it to "
+                        "the proxy's exit country.")
+    g.add_argument("--fp-refresh", action="store_true",
+                   help="Fetch a new fingerprint instead of the cached one "
+                        "for the same flags (each fetch is billed).")
+
+
+# --- CLI ----------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    p = argparse.ArgumentParser(description="Fetch a browser fingerprint from 2Captcha")
+    p.add_argument("--key", default=None,
+                   help="Prefer TWOCAPTCHA_KEY in .env or the environment — argv is readable by `ps`.")
+    p.add_argument("--tags", default=DEFAULT_TAGS, metavar="TAG", help="ONE OS-family tag")
+    p.add_argument("--country", default=None, help="ISO 3166-1 alpha-2, e.g. be")
+    p.add_argument("--min-browser-version", type=int, default=None)
+    p.add_argument("--browser-version", type=int, default=None)
+    p.add_argument("--build-version", default=None, help="/generate only, e.g. 145.0.7632.162")
+    p.add_argument("--format", dest="fmt", choices=["chromium", "raw"], default="chromium")
+    p.add_argument("--generate", action="store_true",
+                   help="Use /fingerprint/generate instead of /fingerprint/random")
+    p.add_argument("--no-cache", action="store_true")
+    p.add_argument("--refresh", action="store_true", help="Bypass a cached copy")
+    p.add_argument("--explain", action="store_true",
+                   help="Print, per applied setting, the value and the response "
+                        "field it came from, instead of the whole response")
+    args = p.parse_args(argv)
+    if not args.key:
+        import env_config  # CLI only: the library functions above need nothing local
+        holder = argparse.Namespace(twocaptcha_key=None)
+        env_config.apply_env_defaults(holder)
+        args.key = holder.twocaptcha_key
+    if not args.key:
+        logger.error("No API key: put TWOCAPTCHA_KEY in .env or export it.")
+        return 2
+    try:
+        fp = get_fingerprint(
+            args.key, tags=args.tags, country=args.country,
+            min_browser_version=args.min_browser_version,
+            browser_version=args.browser_version, build_version=args.build_version,
+            fmt=args.fmt, generate=args.generate,
+            cache_dir=None if args.no_cache else "default", refresh=args.refresh)
+    except FingerprintError as exc:
+        logger.error("%s", exc)
+        return 5
+    if args.explain:
+        for name, v in describe(fp).items():
+            print("%-22s %-40s %s" % (name, str(v["from"] or "-- NOT IN RESPONSE --"),
+                                      str(v["value"])[:80]))
+        print("%-22s %s" % ("client hints", "yes" if user_agent_override(fp) else "NO"))
+    else:
+        print(json.dumps(fp, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(1)

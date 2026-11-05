@@ -66,6 +66,7 @@ from output_writer import (
     PAGE_CONTENT, PAGE_BLOCKED, PAGE_PARSER_FAILED, split_page_result,
     is_last_page, RunInterrupted, install_interrupt_flag, interrupt_seen,
 )
+import fingerprint_client
 import proxy_check
 import proxy_meter
 from env_config import (
@@ -288,6 +289,74 @@ class CdpConnection:
             self._pw = None
 
 
+# --- 2Captcha fingerprint (local browser only) -------------------------------
+# Fetched once per run, before page 1: every attempt launches its own browser
+# (see _fetch_page), and each gets the SAME identity -- a rotation onto a new
+# exit included -- because each fetch is billed. Never applied over
+# --cdp-endpoint: the Scraping Browser brings its own fingerprint.
+_fp_lock = threading.Lock()
+
+
+def _fingerprint(args):
+    """The run's fingerprint dict, or None without --fingerprint. The first
+    call fetches it (FingerprintError propagates: the run stops before any
+    page is fetched without the identity that was asked for)."""
+    if not getattr(args, "fingerprint", False):
+        return None
+    with _fp_lock:
+        if getattr(args, "fp", None) is None:
+            fp = fingerprint_client.get_fingerprint(
+                args.twocaptcha_key, tags=args.fp_tags,
+                country=args.fp_country, refresh=args.fp_refresh)
+            args.fp_facts = {
+                "id": fp.get("id"), "country": fp.get("country"),
+                "user_agent": fingerprint_client.fingerprint_user_agent(fp),
+                "not_in_response": fingerprint_client.missing_fields(fp),
+                "client_hints": False, "readback": None, "mismatches": None,
+            }
+            logger.info("Fingerprint %s (%s): %s", fp.get("id"), fp.get("country"),
+                        (args.fp_facts["user_agent"] or "")[:90])
+            if args.fp_facts["not_in_response"]:
+                logger.warning("Fingerprint fields not in the response, left as the "
+                               "browser's own: %s", ", ".join(args.fp_facts["not_in_response"]))
+            args.fp = fp
+    return args.fp
+
+
+def _apply_ua_override(context, page, args, fp):
+    """User agent WITH client hints, so Sec-CH-UA* and userAgentData match
+    the User-Agent header. Per page: CDP emulation is per target."""
+    override = fingerprint_client.user_agent_override(fp)
+    if not override:
+        return
+    try:
+        context.new_cdp_session(page).send("Emulation.setUserAgentOverride", override)
+        args.fp_facts["client_hints"] = True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not set the fingerprint's client hints: %s",
+                       str(exc).splitlines()[0][:120])
+
+
+def _read_back_fingerprint(page, args):
+    """Once per run, after the first navigation: what the live page reports,
+    compared with the fingerprint. Recorded in the run metadata."""
+    with _fp_lock:
+        facts = getattr(args, "fp_facts", None)
+        fp = getattr(args, "fp", None)
+        if not fp or facts is None or facts.get("readback") is not None:
+            return
+        try:
+            seen = page.evaluate(fingerprint_client.READBACK_JS)
+        except Exception as exc:  # noqa: BLE001
+            facts["readback"] = {"error": str(exc).splitlines()[0][:120]}
+            return
+        facts["readback"] = seen
+        facts["mismatches"] = fingerprint_client.readback_mismatches(fp, seen)
+    if facts["mismatches"]:
+        logger.warning("The page does not report the fingerprint for: %s",
+                       "; ".join(facts["mismatches"]))
+
+
 def _fetch_page(url: str, page_num: int, args, proxy_pool: Optional[ProxyPool],
                  worker_offset: int, cdp: Optional[CdpConnection] = None
                  ) -> Tuple[List[Product], bool, bool, bool, bool]:
@@ -354,6 +423,7 @@ def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, current
             # Over CDP the driver is already running inside `cdp`; a second
             # sync_playwright() in the same thread is refused by Playwright.
             with (contextlib.nullcontext() if cdp else sync_playwright()) as pw:
+                fp = None
                 if cdp:
                     page = cdp.new_page()
                 else:
@@ -367,18 +437,30 @@ def _fetch_page_attempts(url, page_num, args, proxy_pool, worker_offset, current
                         }
                         logger.info("Using proxy exit: %s", current_exit.masked())
                     browser = pw.chromium.launch(**launch_kwargs)
-                    context = browser.new_context(locale="nl-BE")
+                    # A fingerprint, when asked for, is applied HERE only:
+                    # over CDP the remote browser brings its own.
+                    fp = _fingerprint(args)
+                    ctx = {"locale": "nl-BE"}
+                    if fp:
+                        ctx.update(fingerprint_client.playwright_context_kwargs(fp))
+                    context = browser.new_context(**ctx)
+                    if fp:
+                        context.add_init_script(fingerprint_client.playwright_init_script(fp))
                     if proxy_check.block_media(args, current_exit, remote=False):
                         proxy_check.install_playwright(context)
                     # After the media route, so the budget route runs first
                     # (Playwright runs routes in reverse registration order).
                     proxy_meter.install_playwright(context, proxy_meter.of(args))
                     page = context.new_page()
+                    if fp:
+                        _apply_ua_override(context, page, args, fp)
 
                 logger.info("Loading %s (page %d, attempt %d/%d)",
                             url, page_num, attempt + 1, args.retries + 1)
                 response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 http_status = response.status if response else None
+                if fp:
+                    _read_back_fingerprint(page, args)
 
                 # The page gets its chance to render -- or to clear a
                 # challenge by itself -- BEFORE a challenge is looked for
@@ -647,6 +729,13 @@ def _scrape(args, cdp: Optional[CdpConnection]) -> int:
         return finish_without_fetch(
             args.out, stop_reason=refused.stop_reason,
             pages_requested=args.pages, url=args.url, started_at=started_at)
+    try:
+        _fingerprint(args)
+    except fingerprint_client.FingerprintError as e:
+        logger.error("--fingerprint: %s Nothing was fetched.", e)
+        return finish_without_fetch(
+            args.out, stop_reason="fingerprint_api_error",
+            pages_requested=args.pages, url=args.url, started_at=started_at)
     meter = proxy_meter.start(args, proxy_pool, remote=bool(args.cdp_endpoint))
 
     interrupted = False
@@ -761,6 +850,7 @@ def _scrape(args, cdp: Optional[CdpConnection]) -> int:
         listing_end_seen=_listing_end_seen(page_results, failed_pages, result_counts,
                                            len(products_1)),
         interrupted=interrupted,
+        fingerprint=getattr(args, "fp_facts", None),
     )
 
 
@@ -796,7 +886,7 @@ def _proxy_pool(args):
     return pool, proxy_check.gate(pool, args.url)
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Zimmo.be scraper (Playwright edition)")
     p.add_argument("--url", default=None,
                     help="zimmo.be search-results URL (falls back to ZIMMO_URL from .env)")
@@ -842,13 +932,38 @@ def parse_args():
                     help="Always save a debug .html/.png per page, on success too")
     p.add_argument("--headless", action="store_true", default=True)
     p.add_argument("--headful", dest="headless", action="store_false")
-    args = p.parse_args()
+    # Playwright only: the other two engines do not apply a fingerprint, and
+    # argparse refuses the flag there (exit 2) instead of ignoring it.
+    fingerprint_client.add_arguments(p)
+    args = p.parse_args(argv)
 
+    typed_cdp = bool(args.cdp_endpoint)
     apply_env_defaults(args)
+    # Before validate_run_args(), which refuses a proxy next to an endpoint:
+    # with --fingerprint an endpoint from .env is dropped first.
+    _check_fingerprint_args(p, args, typed_cdp)
     validate_run_args(p, args)
     if not args.proxy_urls:
         warn_if_concurrency_without_pool(args.concurrency, None)
     return args
+
+
+def _check_fingerprint_args(p, args, typed_cdp: bool) -> None:
+    """A fingerprint is for a browser launched HERE; never stacked on the
+    Scraping Browser, which brings its own."""
+    if not getattr(args, "fingerprint", False):
+        return
+    if typed_cdp:
+        p.error("--fingerprint applies to a locally launched browser and cannot be "
+                "combined with --cdp-endpoint: the Scraping Browser API brings its own "
+                "fingerprint.")
+    if args.cdp_endpoint:
+        logger.info("--fingerprint: ignoring ZIMMO_CDP_ENDPOINT from the environment "
+                    "and launching a local browser.")
+        args.cdp_endpoint = None
+    if not args.twocaptcha_key:
+        p.error("--fingerprint needs TWOCAPTCHA_KEY (in .env or the environment): the "
+                "Fingerprint API uses that key, on a separate subscription.")
 
 
 if __name__ == "__main__":

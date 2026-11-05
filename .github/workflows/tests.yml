@@ -138,6 +138,25 @@ jobs:
           "
           python ${{ matrix.engine }}_scraper.py --help
 
+      # --fingerprint exists in the Playwright engine only. These checks
+      # import it and launch the installed Chromium against a loopback
+      # server; in the offline job they can only skip, so here a skip is
+      # a failure (FINGERPRINT_REQUIRE_PLAYWRIGHT).
+      - name: Fingerprint checks on a real Chromium (Playwright only)
+        if: matrix.engine == 'playwright'
+        env:
+          FINGERPRINT_REQUIRE_PLAYWRIGHT: "1"
+        run: |
+          source .venv-playwright/bin/activate
+          python -c "
+          import sys, smoke_test as s
+          sys.exit(0 if all([
+              s.check_fingerprint_flags_never_stack_on_the_scraping_browser(),
+              s.check_fingerprint_facts_reach_the_run_metadata(),
+              s.check_fingerprint_is_applied_to_a_real_local_chromium(),
+          ]) else 1)
+          "
+
   docker-build:
     runs-on: ubuntu-latest
     # "Build the Docker image in CI. Nothing else does, which is how
