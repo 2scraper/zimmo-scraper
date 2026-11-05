@@ -43,6 +43,30 @@ here rather than treated as a violation of the format.
 
 ### Added
 
+- `--fingerprint`, `--fp-tags`, `--fp-country`, `--fp-refresh`
+  (`playwright_scraper.py`, local browser only). Fetches a profile from the
+  2Captcha Fingerprint API with `TWOCAPTCHA_KEY` and applies it to every
+  browser the run launches: user agent with matching client hints
+  (`Sec-CH-UA*`, `navigator.userAgentData`), locale and `Accept-Language`,
+  timezone, screen, window and scale factor, navigator values and WebGL
+  strings. The values are read back from the page after the first navigation
+  and recorded under `fingerprint` in `<out>.meta.json`. Refused with a typed
+  `--cdp-endpoint` (exit 2); a `ZIMMO_CDP_ENDPOINT` from `.env` is ignored for
+  the run; refused without a key (exit 2). A Fingerprint API refusal (e.g.
+  `403 ERROR_FINGERPRINT_PLAN_REQUIRED`) exits 5 before any page is fetched.
+  Selenium and Puppeteer do not take the flag (exit 2).
+- `fingerprint_client.py` replaced by the client that reads a real
+  `format=chromium` response (`/fingerprint/random`, key as a query
+  parameter, responses cached in `~/.cache/2captcha-fingerprints/`, the key
+  redacted from every error). The previous module called an endpoint and
+  fields that had not been verified, and no engine used it.
+- Offline checks: field mapping against `fixtures/fingerprint_chromium.json`
+  (a trimmed real response), the refusal path with `HOME` isolated so no
+  cached profile can answer, the flag conflicts, the metadata record, and a
+  real local Chromium against a loopback server that checks the
+  `User-Agent`, `Sec-CH-UA` and `Accept-Language` headers. CI's Playwright
+  job runs these and fails if they skip.
+
 - `proxy_meter.py`: per-run proxy traffic meter and budget, in all three
   engines, only through a local proxy. Playwright sums `request.sizes()`;
   pyppeteer and Selenium count CDP `Network.loadingFinished.encodedDataLength`

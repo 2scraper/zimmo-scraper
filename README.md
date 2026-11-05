@@ -102,7 +102,11 @@ challenge appeared on a residential exit with a headful browser, and a
 solve against the Cloudflare interstitial the other paths meet was not
 tested here.
 
-`fingerprint_client.py` is shipped but not wired into any engine yet.
+A **2Captcha fingerprint** (`--fingerprint`, Playwright with a local
+browser only) is a separate subscription and not needed for access: the
+measured runs above used none, and no access difference with and without
+one has been measured. See
+[A 2Captcha fingerprint on a local browser](#a-2captcha-fingerprint-on-a-local-browser-playwright).
 
 ## Quick start
 
@@ -183,6 +187,52 @@ from `TWOCAPTCHA_KEY` in `.env`; it uses a proxy only when you pass
 python3 scraper_api_client.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/"
 ```
 
+### A 2Captcha fingerprint on a local browser (Playwright)
+
+```bash
+python3 playwright_scraper.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/" \
+  --headful --fingerprint --fp-country de
+```
+
+`--fingerprint` fetches one profile from the
+[2Captcha Fingerprint API](https://2captcha.com/fingerprints/api) with
+`TWOCAPTCHA_KEY` and applies it to the Chromium this scraper launches: user
+agent together with its client hints (`Sec-CH-UA*`, `navigator.userAgentData`),
+locale and `Accept-Language`, timezone, screen and window size, device scale
+factor, `navigator.platform` / `hardwareConcurrency` / `deviceMemory` and the
+WebGL vendor and renderer strings. Every page's browser gets the same
+profile. After the first page the scraper reads these back from the live
+page and records them, with any mismatch, under `fingerprint` in
+`<out>.meta.json`.
+
+* **Local browser only.** The Scraping Browser API brings its own
+  fingerprint, so a typed `--cdp-endpoint` with `--fingerprint` exits 2, and a
+  `ZIMMO_CDP_ENDPOINT` from `.env` is ignored for that run (with a notice).
+  Selenium and Puppeteer do not implement `--fingerprint` and refuse it (exit 2).
+* **A separate subscription.** A key without a fingerprint plan is answered
+  `403 ERROR_FINGERPRINT_PLAN_REQUIRED`; the run then exits 5 before any page
+  is fetched, with `stop_reason: fingerprint_api_error` in
+  `<out>.latest_attempt.meta.json`.
+* `--fp-tags` takes ONE tag (default `Windows`). `--fp-country` should match
+  the proxy's exit. The response is cached in
+  `~/.cache/2captcha-fingerprints/` per set of flags, so the same flags give the
+  same identity (and no new charge); `--fp-refresh` fetches a new one.
+* It does not replace what zimmo.be needs: a residential exit and
+  `--headful` (see [What you need](#what-you-need)).
+* What it does not change: the browser engine underneath is still the
+  installed Chromium, which may be a different version from the one the
+  profile names, and WebGL output is the real GPU's.
+
+Measured 2026-11-05: `--fingerprint --fp-country de --headful --pages 1
+--solve-captcha never`, Playwright 1.44 (Chromium 125) under xvfb through a
+German residential proxy, `/nl/gent-9000/te-koop/`: 21 rows, exit 0. The
+account had no fingerprint plan that day (`403
+ERROR_FINGERPRINT_PLAN_REQUIRED`), so the profile applied was a real API
+response from 2026-09-30 served from the cache; a fresh fetch was not
+exercised. Read back from the page: user agent, client-hint brands and
+platform, `de-DE`, `Europe/Berlin`, `Win32`, 20 cores, 16 GB, 1366×768 — no
+mismatch.
+
 ### All flags
 
 | Flag | Default | Notes |
@@ -211,7 +261,9 @@ python3 scraper_api_client.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/"
 
 The full set above is identical across all three engines — asserted
 automatically by `smoke_test.py`, not just by having copied one file
-into the other two.
+into the other two. `playwright_scraper.py` alone adds `--fingerprint`,
+`--fp-tags`, `--fp-country` and `--fp-refresh` (see
+[A 2Captcha fingerprint on a local browser](#a-2captcha-fingerprint-on-a-local-browser-playwright)).
 
 ## Configuration
 

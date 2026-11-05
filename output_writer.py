@@ -444,6 +444,7 @@ def finish_run(
     proxy: Optional[Dict[str, Any]] = None,
     listing_end_seen: bool = False,
     interrupted: bool = False,
+    fingerprint: Optional[Dict[str, Any]] = None,
 ) -> int:
     """`proxy` is the proxy meter's record (proxy_meter.ProxyMeter.sidecar)
     on a run through a local proxy, None otherwise. When present it goes
@@ -452,6 +453,9 @@ def finish_run(
     that wrote nothing still says what it spent. A run that went over its
     budget stops with stop_reason `proxy_budget_exceeded`: exit 6 with rows,
     exit 5 without, never a complete or empty result.
+
+    `fingerprint` is what --fingerprint applied and read back (Playwright,
+    local browser); recorded as `fingerprint` in the metadata when present.
     """
     rc, meta = _finish_run(
         products, out_prefix, fmt, pages_requested=pages_requested,
@@ -460,7 +464,8 @@ def finish_run(
         remote_api_error=remote_api_error, allow_empty=allow_empty,
         started_at=started_at, exhausted_pages=exhausted_pages, url=url,
         parser_failed_pages=parser_failed_pages, proxy=proxy,
-        listing_end_seen=listing_end_seen, interrupted=interrupted)
+        listing_end_seen=listing_end_seen, interrupted=interrupted,
+        fingerprint=fingerprint)
     if proxy is not None or (interrupted and meta is None):
         if meta is None:
             # Nothing was written; record the attempt without touching any
@@ -487,6 +492,7 @@ def finish_run(
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "source": "zimmo.be",
                 **(proxy or {}),
+                **({"fingerprint": fingerprint} if fingerprint is not None else {}),
             }
         write_attempt_meta(meta, out_prefix)
     return rc
@@ -510,7 +516,7 @@ def _finish_run(products, out_prefix, fmt, *, pages_requested, pages_completed,
                 failed_pages, unattempted_pages, blocked, remote_api_error,
                 allow_empty, started_at, exhausted_pages, url,
                 parser_failed_pages, proxy, listing_end_seen=False,
-                interrupted=False):
+                interrupted=False, fingerprint=None):
     """The single place that decides status, exit code, and whether/what
     to write.
 
@@ -669,6 +675,7 @@ def _finish_run(products, out_prefix, fmt, *, pages_requested, pages_completed,
         "source": "zimmo.be",
         "csv_cells_escaped": csv_cells_escaped,
         **(proxy or {}),
+        **({"fingerprint": fingerprint} if fingerprint is not None else {}),
     }
     write_meta(meta, out_prefix)
 
