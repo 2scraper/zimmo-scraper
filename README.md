@@ -16,7 +16,146 @@ living area, bedrooms, EPC labels, proxies, captcha solving.
 
 ---
 
-## What this actually does
+## Example output
+
+Two records from [`sample_output.json`](sample_output.json), a real run on
+2026-09-23 — every column, in the output's order (`image_url` shortened):
+
+```json
+[
+  {
+    "source": "zimmo.be",
+    "scraped_at": "2026-09-23T14:20:10.757167+00:00",
+    "url": "https://www.zimmo.be/nl/gent-9000/te-koop/huis/LRZLA",
+    "sku": "LRZLA",
+    "title": "Huis te koop",
+    "brand": null,
+    "price": 210000.0,
+    "currency": "EUR",
+    "original_price": null,
+    "discount_pct": null,
+    "image_url": "https://files.zimmo.be/backend-api/qMbJs7nn9uXzLU5aLtWl6XQOLD0=/828x618/filters:image-format(pjpg)/-/real-estate/…",
+    "category": "gent-koop",
+    "listing_type": "sale",
+    "property_type": "huis",
+    "location": "Zwijnaardsesteenweg 685 9000 Gent",
+    "surface_m2": null,
+    "bedrooms": 3,
+    "epc_label": "F",
+    "epc_value": null
+  },
+  {
+    "source": "zimmo.be",
+    "scraped_at": "2026-09-23T14:20:10.758284+00:00",
+    "url": "https://www.zimmo.be/nl/gent-9000/te-koop/appartement/LRZKI",
+    "sku": "LRZKI",
+    "title": "Appartement te koop",
+    "brand": null,
+    "price": 355000.0,
+    "currency": "EUR",
+    "original_price": null,
+    "discount_pct": null,
+    "image_url": "https://files.zimmo.be/backend-api/uoqMARL1lhm7fEW59A_yJjriSMI=/828x618/filters:image-format(pjpg)/-/real-estate/…",
+    "category": "gent-koop",
+    "listing_type": "sale",
+    "property_type": "appartement",
+    "location": "Martelaarslaan 287 9000 Gent",
+    "surface_m2": 92.0,
+    "bedrooms": 2,
+    "epc_label": null,
+    "epc_value": null
+  }
+]
+```
+
+Full sample: [`sample_output.json`](sample_output.json) · 21 rows, collected
+2026-09-23 (one results page of `/nl/gent-9000/te-koop/`).
+
+`location` is the address as the tile states it, `surface_m2` the living
+area, `epc_label` the energy grade; `null` means the tile did not state it
+(here: no living area on the first tile, no grade on the second). Which
+columns are filled, and how often, is under
+[Coverage and limitations](#coverage-and-limitations).
+
+## Requirements and access
+
+| | |
+|---|---|
+| Runtime | Python 3.9–3.12 (3.13 with the workaround in [Quick start](#quick-start)); Playwright 1.44, pinned, is the primary engine; Selenium or pyppeteer as alternatives, one per virtualenv |
+| Coverage | zimmo.be search-results pages, sale and rent, on the Dutch (`/nl/…/te-koop/`) and French (`/fr/…/a-vendre/`) sites: one row per listing with price (EUR), address, property type, living area, bedrooms and energy grade. See [Coverage and limitations](#coverage-and-limitations) |
+| Required for the documented scenario | **A residential exit and a visible (headful) browser** — on a server, a residential proxy in `ZIMMO_PROXY` plus `xvfb-run` — **or** the 2Captcha Scraping Browser API, which brings both. No 2Captcha key. Datacentre addresses and headless Chromium are refused |
+| Optional: 2Captcha Scraping Browser API | The one path that needs neither a residential address nor a display of your own (`country-be` served 63 rows, 3 of 3 pages, on 2026-09-23) |
+| Optional: residential proxies | Give a local browser the address it needs; Belgian and German exits were served, a US exit was refused (2026-10-13). One results page ≈ 2.6 MB of proxy traffic |
+| Optional: Scraper API | A page with no browser, one request per page ($0.0005 per request on 2026-09-23); it returned an empty results page on 2026-10-28, so do not rely on it here |
+| Optional: captcha solving, fingerprint | Not needed for access and not exercised against the Cloudflare interstitial; the fingerprint is a separate subscription. See [What you need](#what-you-need) |
+| Measured | Access: 2026-09-23 and 2026-10-13 (commits not recorded); served run through a German residential exit on 2026-11-05 (PR #17); a datacentre refusal re-checked on 2026-11-17 at `ebf1333`. See [Verification](#verification) |
+
+## Quick start
+
+```bash
+git clone https://github.com/2scraper/zimmo-scraper.git
+cd zimmo-scraper
+python3 -m venv .venv && . .venv/bin/activate   # Python 3.9-3.12, see below for 3.13
+pip install -r requirements.txt -r requirements-playwright.txt
+playwright install chromium
+
+cp .env.example .env   # on a server: set ZIMMO_PROXY to a residential proxy
+
+python3 playwright_scraper.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/" --headful
+# on a server with no display:
+xvfb-run -a python3 playwright_scraper.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/" --headful
+```
+
+**Python 3.13 and newer:** the pinned `playwright==1.44.0` needs
+`greenlet==3.0.3`, which has no wheel and does not build there ("Failed to
+build installable wheels ... greenlet"). Use Python 3.12 or older (e.g.
+`python3.12 -m venv .venv`), or install a current greenlet first and the
+pin without its dependencies: `pip install greenlet pyee==11.1.0` then
+`pip install --no-deps playwright==1.44.0`.
+
+Selenium and Puppeteer (pyppeteer) work the same way, with their own
+`requirements-{engine}.txt` — see [Engines](#engines) for why you
+should install exactly one at a time.
+
+One page is read by default (`--pages` for more). It writes three files to
+the current directory (choose the prefix with `--out`):
+
+* `zimmo_listings.json` and `zimmo_listings.csv` — one row per listing;
+* `zimmo_listings.meta.json` — the run's `status`, `stop_reason`, failed
+  pages and whether the listing was read to its end.
+
+If the run does not end with exit 0:
+
+* **exit 3, blocked** — Cloudflare refused the page: headless, a datacentre
+  address or a US exit. Use `--headful` with a Belgian or German residential
+  exit, or the Scraping Browser API. See [What you need](#what-you-need).
+* **exit 4, zero listings** — the page stated a result count of 0: the
+  search matched nothing. Nothing is written over earlier output.
+* **exit 5 or 6, not obtained or partial** — a proxy that answers 407/402
+  stops the run before the browser starts (exit 5); a failed page or the
+  10 MB proxy budget (about three pages) ends it partial (exit 6), with the
+  pages named in the `.meta.json`. See [Output](#output) and
+  [Proxy traffic savers](#proxy-traffic-savers).
+
+Setup, `.env` and exit codes for the whole family:
+[How to run the 2scraper scrapers](https://2captcha.com/h/how-to-run-2scraper-open-source-scrapers).
+
+## Coverage and limitations
+
+The short version:
+
+* Search-results pages only (`--url` must be one; anything else is exit 2):
+  one row per listing tile, sale and rent, Dutch and French sites.
+* `brand`, `original_price`, `discount_pct` and `epc_value` are always null
+  on today's site.
+* A new-build project's `price` is its lowest unit price ("Vanaf …").
+* A French search that runs past its last page ends partial (exit 6), not
+  complete: the French "no result" wording is not known.
+* The default 10 MB proxy budget covers about three pages.
+* Through the Scraper API, a page with no listing is exit 5, never an empty
+  search.
+
+### What this actually does
 
 It reads zimmo.be search-results pages — sale and rent, the Dutch
 (`/nl/…/te-koop/`) and French (`/fr/…/a-vendre/`) sites — and writes one
@@ -56,6 +195,33 @@ Things to know about the columns:
 - Energy grades include Brussels' minus grades (`E-`, from
   `epb_e_minus.svg`) as well as `A+`/`A++`.
 
+## Examples
+
+- [How to scrape Zimmo: step-by-step guide](https://2captcha.com/h/how-to-scrape-zimmo)
+- [Zimmo scraper on 2scraper.com](https://2scraper.com/scrapers/zimmo-scraper/) — what it collects, requirements and related scrapers on one page.
+- [How to run the 2scraper scrapers: setup, proxies, exit codes and access modes](https://2captcha.com/h/how-to-run-2scraper-open-source-scrapers) — installation, `.env`, `.meta.json` for the whole family.
+
+
+Commands for each access path — a local browser through a residential exit,
+the Scraping Browser API and the Scraper API — are under [Usage](#usage).
+
+## Verification
+
+The served path needs a paid residential exit or the Scraping Browser API, so
+it was **not re-run in this pass**; the last served run is the one from
+2026-11-05 below.
+
+| Date, commit | Check | Conditions | Result |
+|---|---|---|---|
+| 2026-11-17, `ebf1333` | Quick start install | a fresh virtualenv, Python 3.13 | the plain `pip install` fails building greenlet, as described above; the 3.13 workaround installs, and every flag in the Quick start is in `--help` |
+| 2026-11-17, `ebf1333` | Quick start command, `--pages 1 --retries 0` | `xvfb-run`, `--headful`, no proxy, no `.env`, one datacentre address | HTTP 403 Cloudflare challenge, classified as blocked, exit 3, nothing written, no paid call — the refusal described under [What you need](#what-you-need) |
+| 2026-11-17, `ebf1333` | Offline suite | `python3 smoke_test.py`, core requirements only | passed |
+| 2026-11-05, PR #17 | One page with a cached fingerprint | Playwright 1.44 under xvfb, headful, German residential proxy, `/nl/gent-9000/te-koop/` | 21 rows, exit 0 |
+| 2026-10-27/28 | Manual test | live Gent, Brussels and Antwerp runs | 168 rows; through a German residential exit, headful, 3 pages ≈ 7.8 MB (Playwright) |
+| 2026-10-13 | Exit country | residential exits | Belgian and German exits served, a US exit refused |
+| 2026-09-23 | Access matrix | see [What you need](#what-you-need) | served only to a headful browser on a residential exit, or the Scraping Browser API |
+| 2026-10-21 to 2026-11-16 | [Canary](https://github.com/2scraper/zimmo-scraper/actions/workflows/canary.yml) (weekly, 3 pages, headful, through the `ZIMMO_PROXY` secret) | a GitHub runner | last green on 2026-10-21 (manual run, `c4795bb`). Every weekly run from 2026-10-26 to 2026-11-16 failed before any page was fetched: the proxy pre-check got HTTP 407 for the secret's credential (refused, or traffic exhausted). These runs say nothing about the site |
+
 ## What you need
 
 **No 2Captcha key. But a residential exit and a visible browser.** Every
@@ -79,8 +245,9 @@ Scraping Browser API read 63 listings from the same URL; a Brussels request
 timed out. A page with no listing from the Scraper API is therefore
 reported as **content not obtained (exit 5)**, never as an empty search.
 
-So on a home connection, `--headful` is the whole requirement — the exit
-does not have to be Belgian. On a server, you need a residential proxy
+So on a Belgian or German home connection, `--headful` is the whole
+requirement — the exit does not have to be Belgian, but a US residential
+exit was refused on 2026-10-13 (see [Verification](#verification)). On a server, you need a residential proxy
 (`ZIMMO_PROXY` in `.env`) **and** a display for the headful browser
 (`xvfb-run`), or the Scraping Browser API, which brings both. Headless is
 refused even from a residential address, which is why every example below
@@ -107,33 +274,6 @@ browser only) is a separate subscription and not needed for access: the
 measured runs above used none, and no access difference with and without
 one has been measured. See
 [A 2Captcha fingerprint on a local browser](#a-2captcha-fingerprint-on-a-local-browser-playwright).
-
-## Quick start
-
-```bash
-git clone https://github.com/2scraper/zimmo-scraper.git
-cd zimmo-scraper
-python3 --version   # 3.9-3.12, see below
-pip install -r requirements.txt -r requirements-playwright.txt --break-system-packages
-playwright install chromium
-
-cp .env.example .env   # on a server: set ZIMMO_PROXY to a residential proxy
-
-python3 playwright_scraper.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/" --headful
-# on a server with no display:
-xvfb-run -a python3 playwright_scraper.py --url "https://www.zimmo.be/nl/gent-9000/te-koop/" --headful
-```
-
-**Python 3.13 and newer:** the pinned `playwright==1.44.0` needs
-`greenlet==3.0.3`, which has no wheel and does not build there ("Failed to
-build installable wheels ... greenlet"). Use Python 3.12 or older (e.g.
-`python3.12 -m venv .venv`), or install a current greenlet first and the
-pin without its dependencies: `pip install greenlet pyee==11.1.0` then
-`pip install --no-deps playwright==1.44.0`.
-
-Selenium and Puppeteer (pyppeteer) work the same way, with their own
-`requirements-{engine}.txt` — see [Engines](#engines) for why you
-should install exactly one at a time.
 
 ## Usage
 
@@ -338,8 +478,8 @@ site serves only a residential exit driving a headful browser, and a free
 comparison from a datacentre address (2026-10-20, headful, no proxy) got
 Cloudflare's HTTP 403. So a media-blocked run could not be checked
 against a normal one, and a bot manager this strict may score a browser
-that never fetches images or fonts. The parser reads the page's listing
-JSON and text, not media. It is never applied over `--cdp-endpoint`.
+that never fetches images or fonts. The parser reads the rendered tiles'
+markup and text, not media. It is never applied over `--cdp-endpoint`.
 **On zimmo.be it saves next to nothing:** measured 2026-10-28 through a
 German residential exit, headful, 3 pages, Playwright: 8.1 MB with it and
 7.8 MB without (another pair, 8.2 MB vs 8.7 MB). The weight of a page here
@@ -506,9 +646,67 @@ checked for drift by `smoke_test.py`, so a consumer outside Python can
 validate a run. `x-schema-version` goes up whenever a column is added,
 renamed or removed, and the CHANGELOG says so.
 
-## Guides
+## FAQ
 
-- [How to run the 2scraper scrapers: setup, proxies, exit codes and access modes](https://2captcha.com/h/how-to-run-2scraper-open-source-scrapers) — installation, `.env`, `.meta.json` for the whole family.
+### Does Zimmo have a public API?
+
+This repository does not use or need one. It reads zimmo.be's public
+search-results pages as a browser renders them: the site's own grid carries
+no listing data in any structured block, so rows come from the rendered
+tiles. See [What this actually does](#what-this-actually-does).
+
+### Is it legal to scrape zimmo.be?
+
+This is not legal advice. Scraping public pages is permitted in many
+jurisdictions, but zimmo.be's terms of use, copyright in listing texts and
+photos, and data-protection law differ between countries. The scraper reads
+public search pages only and does not log in. Keep the request rate low
+(`--delay`), and do not collect personal data, such as an advertiser's
+contact details, without a lawful basis.
+
+### Why does Zimmo block headless browsers and datacentre IPs?
+
+zimmo.be sits behind Cloudflare, and Cloudflare does not publish its reasons.
+What was measured: from a datacentre address every client got a Cloudflare
+challenge (HTTP 403), and headless Chromium was refused even from a Belgian
+residential address; a headful browser on a Belgian or German residential
+exit was served, a US residential exit was not. Re-checked from a
+datacentre on 2026-11-17: still HTTP 403, exit 3.
+
+### How do I run the Zimmo scraper on a server?
+
+Either put a Belgian or German residential proxy in `ZIMMO_PROXY` in `.env`
+and run the headful browser under `xvfb-run`, as in the
+[Quick start](#quick-start), or put a Scraping Browser API endpoint in
+`ZIMMO_CDP_ENDPOINT`, which needs neither a residential address nor a display.
+The Docker image runs headless, so use it with `--cdp-endpoint`. Through a
+proxy, a run stops at 10 MB by default (about three pages); raise
+`--proxy-budget-mb` for more.
+
+### What fields does the scraper return?
+
+19 columns per listing, in the same order in JSON and CSV: `source`,
+`scraped_at`, `url`, `sku` (the listing's Zimmo code), `title`, `brand`,
+`price`, `currency`, `original_price`, `discount_pct`, `image_url`,
+`category`, `listing_type`, `property_type`, `location`, `surface_m2`,
+`bedrooms`, `epc_label`, `epc_value`. `product.schema.json` describes one row.
+
+### Does it work on the French site?
+
+Yes: pass a `/fr/…/a-vendre/` search URL. The bedrooms, area and energy-grade
+icons are the same on the Dutch and French sites, so the same columns are
+filled. One difference: a French search that runs past its last page ends
+partial (exit 6) rather than complete, because the French "no result" line
+has not been captured.
+
+### How often does it break when zimmo.be changes?
+
+The site has changed under the scraper at least twice: the embedded listing
+JSON disappeared in September 2026, and the page past the end of a search
+changed in October 2026; both are handled and recorded in
+[CHANGELOG.md](CHANGELOG.md). A weekly canary checks a real 3-page run, but
+it has been failing on its proxy credential since 2026-10-26 (see
+[Verification](#verification)), so it is not watching the site right now.
 
 ## Related scrapers
 
