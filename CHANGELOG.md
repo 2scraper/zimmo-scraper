@@ -107,6 +107,7 @@ here rather than treated as a violation of the format.
 
 ### Changed
 
+- CI only: the offline-checks job runs on `ubuntu-24.04` instead of `ubuntu-latest`, which moved to Ubuntu 26.04, where `actions/setup-python` has no Python 3.9 build. 3.9 stays the supported floor.
 - `pyproject.toml`'s `playwright` extra pins `playwright==1.44.0`, as
   `requirements-playwright.txt` and the Docker image do; it said `>=1.44`.
 - README: Python 3.13+ install note for the 1.44 pin, how far the 10 MB
